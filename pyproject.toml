@@ -18,7 +18,7 @@ dependencies = [
 dev = ["pytest", "pytest-asyncio"]
 
 [project.urls]
-Repository = "https://github.com/andrew-maseko/hermes-memory-lancedb"
+Repository = "https://github.com/TheophilusChinomona/hermes-memory-lancedb"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hermes_memory_lancedb"]
