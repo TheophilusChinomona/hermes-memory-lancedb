@@ -6,3 +6,5 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+# Runtime lock dir created by LanceDBStore.with_lock when storage_path is unset
+.locks/

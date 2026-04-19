@@ -635,6 +635,13 @@ class TestSchemaMigrationAddsScopeColumns(unittest.TestCase):
 
         fake_table.add_columns.side_effect = fake_add
         provider._table = fake_table
+        # v2.0.0: provider now routes schema work through self._store. Wrap
+        # the fake table in a LanceDBStore adapter so the existing fake-table
+        # contract (.schema, .add_columns) drives the migration as before.
+        from hermes_memory_lancedb.backends import make_lancedb_store
+        provider._store = make_lancedb_store(
+            db=None, table=fake_table, storage_path="", table_name="memories",
+        )
         provider._added = added  # type: ignore[attr-defined]
         return provider, fake_table, added
 
