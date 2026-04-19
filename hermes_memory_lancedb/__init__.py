@@ -105,6 +105,7 @@ Activate in ~/.hermes/config.yaml:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -114,6 +115,7 @@ import re
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .embedders import (
@@ -159,6 +161,10 @@ from . import sessions as _sessions  # noqa: E402
 from . import compactor as _compactor  # noqa: E402
 from . import auto_capture as _auto_capture  # noqa: E402
 from . import query as _query  # noqa: E402
+
+# v1.7.0 (P5) — observability classes re-exported so callers can use them
+# without a deeper import.
+from .observability import RetrievalStats, RetrievalTrace  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # MemoryProvider base
@@ -233,6 +239,9 @@ _DEFAULT_EXTRACTION_MODEL = "gpt-4o-mini"
 
 # Tier decay floors applied during search
 _TIER_DECAY_FLOOR = {"core": 0.9, "working": 0.7, "peripheral": 0.0}
+
+# How long writers wait for a sibling Hermes process to release the table lock.
+_WRITE_LOCK_TIMEOUT_S = 30.0
 
 # Tier promotion / demotion thresholds
 _PROMO_PERI_TO_WORK_ACCESS = 3
@@ -748,6 +757,59 @@ def _rerank_cosine_fallback(
         return hits
 
 
+@contextlib.contextmanager
+def _with_lock(table_path: str, *, timeout: float = _WRITE_LOCK_TIMEOUT_S):
+    """Cross-process file lock around a LanceDB table directory.
+
+    Uses ``portalocker`` so multiple Hermes processes can share the same
+    LanceDB without corrupting each other's writes. The lock file lives next
+    to the table directory and is created on demand.
+
+    Falls back to a no-op when ``portalocker`` is not installed (so the
+    package still works in minimal environments — just without
+    cross-process safety).
+    """
+    try:
+        import portalocker
+    except ImportError:
+        logger.debug("portalocker not installed; running without cross-process lock")
+        yield None
+        return
+
+    lock_path = Path(table_path).expanduser().with_suffix(".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.debug("could not create lock dir %s: %s", lock_path.parent, e)
+        yield None
+        return
+
+    fh = open(lock_path, "a+")
+    try:
+        try:
+            portalocker.lock(
+                fh,
+                portalocker.LOCK_EX,
+                timeout=timeout,
+            )
+        except Exception as e:
+            logger.warning("file lock at %s timed out/failed: %s", lock_path, e)
+            yield None
+            return
+        try:
+            yield fh
+        finally:
+            try:
+                portalocker.unlock(fh)
+            except Exception:
+                pass
+    finally:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
 def _msg_text(msg: Dict) -> str:
     content = msg.get("content", "")
     if isinstance(content, str):
@@ -906,6 +968,9 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._compactor_trigger = _compactor.CompactionTrigger(every_n=every_n)
         # P4: recovered-context block exposed via system_prompt_block().
         self._recovered_context = ""
+
+        # v1.7.0 P5: observability — accumulated stats across queries.
+        self._stats = RetrievalStats(max_records=1000)
 
     @property
     def name(self) -> str:
@@ -1243,9 +1308,18 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             new_fields = {**v110_fields, **scope_fields}
             missing = {k: v for k, v in new_fields.items() if k not in existing_cols}
             if missing:
-                self._table.add_columns(missing)
-                logger.info("LanceDB schema migrated: added columns %s", list(missing.keys()))
-            # Determine whether scope columns are now present (either pre-existing
+                # P5: wrap migration in the table lock so two Hermes processes
+                # can't try to add the same columns simultaneously.
+                table_path = os.path.join(self._storage_path, _TABLE_NAME)
+                with _with_lock(table_path):
+                    # Re-check after acquiring the lock — another process may
+                    # have already migrated.
+                    existing_cols = {f.name for f in self._table.schema}
+                    missing = {k: v for k, v in new_fields.items() if k not in existing_cols}
+                    if missing:
+                        self._table.add_columns(missing)
+                        logger.info("LanceDB schema migrated: added columns %s", list(missing.keys()))
+            # P1: determine whether scope columns are now present (either pre-existing
             # or just-added). Used to choose between legacy `user_id`-only
             # filtering and the composable scope filter.
             updated_cols = {f.name for f in self._table.schema}
@@ -1258,6 +1332,25 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 self._has_scope_columns = all(c in cols for c in SCOPE_COLUMNS)
             except Exception:
                 self._has_scope_columns = False
+
+    # ----- v1.7.0 observability accessors ---------------------------------
+
+    def get_stats(self) -> Dict:
+        """Return rolling aggregate retrieval stats (zero-cost when empty)."""
+        return self._stats.get_stats()
+
+    def reset_stats(self) -> None:
+        """Reset the rolling stats buffer."""
+        self._stats.reset()
+
+    @property
+    def storage_path(self) -> str:
+        return self._storage_path
+
+    @property
+    def table(self):
+        """Direct access to the underlying LanceDB table (for CLI commands)."""
+        return self._table
 
     def system_prompt_block(self) -> str:
         if not self._ready:
@@ -1313,16 +1406,27 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             legacy_user_id=self._user_id or None,
         )
 
-    def _hybrid_search(self, query: str, top_k: int = _TOP_K_RETURN) -> List[Dict]:
+    def _hybrid_search(
+        self,
+        query: str,
+        top_k: int = _TOP_K_RETURN,
+        *,
+        trace: Optional["RetrievalTrace"] = None,
+    ) -> List[Dict]:
         if not self._ready or self._table is None or self._embedder is None:
             return []
         try:
             vec = self._embedder.embed(query)
             where_clause = self._build_scope_where()
+            if trace is not None:
+                trace.start_stage("vector_search", input_ids=[])
             v_search = self._table.search(vec, vector_column_name="vector")
             if where_clause:
                 v_search = v_search.where(where_clause, prefilter=True)
             v_results = v_search.limit(_TOP_K_VECTOR).to_list()
+            if trace is not None:
+                trace.end_stage([str(r.get("id", "")) for r in v_results])
+                trace.start_stage("bm25", input_ids=[])
 
             # P4: query expansion — fan out BM25 across original + synonym variants,
             # de-duplicating by id while preserving the best rank per id. Falls
@@ -1356,6 +1460,9 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                         break
             except Exception:
                 b_results = []
+            if trace is not None:
+                b_ids = [str(r.get("id", "")) for r in b_results]
+                trace.end_stage(b_ids)
 
             def _hit(row) -> Optional[Dict]:
                 ts = row.get("timestamp", 0.0) or 0.0
@@ -1387,11 +1494,25 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             v_hits = [h for r in v_results if (h := _hit(r))]
             b_hits = [h for r in b_results if (h := _hit(r))]
 
+            def _ids(items):
+                return [str(it.get("id", "")) for it in items]
+
+            def _scores(items):
+                return [float(it.get("score", 0.0)) for it in items]
+
             # Stage 1: RRF fusion — fetch a wider window than top_k so the
             # downstream stages (rerank/length-norm/MMR) have enough to work with.
             rerank_window = max(top_k * 4, 12)
+            if trace is not None:
+                fusion_input = list({h["id"] for h in v_hits + b_hits})
+                trace.start_stage("rrf", input_ids=fusion_input)
             merged = _merge_rrf(v_hits, b_hits, top_k=rerank_window)
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
             if not merged:
+                if trace is not None:
+                    trace.finalize(query, "hybrid")
+                    self._stats.record_query(trace, source=getattr(trace, "_source", "unknown"))
                 return []
 
             # Stage 1b (P4): intent-based category boost. Cheap rule-based
@@ -1416,8 +1537,15 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
             # Stage 4: Early min-score filter.
+            if trace is not None:
+                trace.start_stage("min_score", input_ids=_ids(merged))
             merged = [h for h in merged if h.get("score", 0.0) >= _MIN_SCORE_EARLY]
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
             if not merged:
+                if trace is not None:
+                    trace.finalize(query, "hybrid")
+                    self._stats.record_query(trace, source=getattr(trace, "_source", "unknown"))
                 return []
 
             # Stage 5: Cross-encoder rerank — Jina if API key configured,
@@ -1443,21 +1571,37 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 )
             if reranked is None and rerank_provider != "none":
                 reranked = _rerank_cosine_fallback(vec, rerank_input)
+            if trace is not None:
+                trace.start_stage("rerank", input_ids=_ids(rerank_input))
             if reranked is not None:
                 merged = sorted(reranked + tail, key=lambda x: x.get("score", 0.0), reverse=True)
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
 
             # Stage 6: Length normalization (penalize sprawling entries).
+            if trace is not None:
+                trace.start_stage("length_norm", input_ids=_ids(merged))
             merged = _apply_length_normalization(merged)
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
 
             # Stage 7: Hard min-score cutoff (drops post-rerank low-confidence hits).
             try:
                 hard_min = float(os.environ.get("LANCEDB_HARD_MIN_SCORE", str(_HARD_MIN_SCORE)))
             except (TypeError, ValueError):
                 hard_min = _HARD_MIN_SCORE
+            if trace is not None:
+                trace.start_stage("hard_min_score", input_ids=_ids(merged))
             merged = [h for h in merged if h.get("score", 0.0) >= hard_min]
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
 
             # Stage 8: MMR diversity — defer near-duplicates to the tail.
+            if trace is not None:
+                trace.start_stage("mmr", input_ids=_ids(merged))
             merged = _apply_mmr_diversity(merged)
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
 
             # Stage 9 (P3): Optionally pull top-K reflections via the
             # reflection store and merge them in. Reflections carry
@@ -1476,7 +1620,13 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     merged = merged + refl_hits
 
             # Final: take top_k.
+            if trace is not None:
+                trace.start_stage("final", input_ids=_ids(merged))
             merged = merged[:top_k]
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
+                trace.finalize(query, "hybrid")
+                self._stats.record_query(trace, source=getattr(trace, "_source", "unknown"))
 
             # Bump access counts async
             if merged:
@@ -1486,6 +1636,12 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return merged
         except Exception as e:
             logger.debug("LanceDB search failed: %s", e)
+            if trace is not None:
+                try:
+                    trace.finalize(query, "hybrid")
+                    self._stats.record_query(trace, source=getattr(trace, "_source", "error"))
+                except Exception:
+                    pass
             return []
 
     def _bump_access(self, ids: List[str]) -> None:
@@ -1660,7 +1816,11 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                         row["scope"] = canonical
                     rows.append(row)
             if rows:
-                self._table.add(rows)
+                # P5: cross-process file lock so multiple Hermes instances don't
+                # corrupt the table when writing concurrently.
+                table_path = os.path.join(self._storage_path or "", _TABLE_NAME)
+                with _with_lock(table_path):
+                    self._table.add(rows)
                 # P4: nudge the compactor — it has its own counter + cooldown.
                 try:
                     for _ in rows:
@@ -2207,4 +2367,7 @@ __all__ = [
     "_compactor",
     "_auto_capture",
     "_query",
+    # P5 observability re-exports
+    "RetrievalStats",
+    "RetrievalTrace",
 ]
