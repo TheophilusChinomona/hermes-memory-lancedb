@@ -1,6 +1,14 @@
-"""hermes-memory-lancedb v1.2.0 — LanceDB vector memory plugin for Hermes agents.
+"""hermes-memory-lancedb v1.3.0 — LanceDB vector memory plugin for Hermes agents.
 
-Hybrid BM25 + vector recall, Weibull decay, OpenAI text-embedding-3-small.
+Hybrid BM25 + vector recall, Weibull decay, multi-provider embeddings.
+
+v1.3.0 additions (P1 of memory-lancedb-pro port — multi-tenancy):
+  - Multi-scope isolation: agent / user / project / team / workspace
+    columns compose orthogonally in the search predicate
+  - Multi-provider embeddings: OpenAI (default), Jina, Gemini, Ollama,
+    plus any OpenAI-compatible endpoint via LANCEDB_EMBED_BASE_URL
+  - Schema migration adds scope columns to existing tables
+  - Embedding dimension is provider-driven (no longer hardcoded)
 
 v1.2.0 additions (P0 of memory-lancedb-pro port — retrieval quality):
   - Cross-encoder reranking via Jina (fallback: cosine of query vs doc vectors)
@@ -18,7 +26,7 @@ v1.1.0 additions (ported from memory-lancedb-pro TypeScript fork):
   - New tools: lancedb_forget, lancedb_stats
 
 Storage:    $LANCEDB_PATH  or  $HERMES_HOME/lancedb/
-Embeddings: OpenAI text-embedding-3-small — OPENAI_API_KEY required
+Embeddings: $LANCEDB_EMBED_PROVIDER (default openai/text-embedding-3-small)
 Extraction: gpt-4o-mini (configurable via lancedb.json extraction_model)
 
 Activate in ~/.hermes/config.yaml:
@@ -38,6 +46,24 @@ import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+from .embedders import (
+    EMBEDDING_DIMENSIONS,
+    Embedder,
+    EmbeddingError,
+    PROVIDER_DEFAULT_MODEL,
+    get_provider_from_env,
+    is_provider_available,
+    make_embedder,
+)
+from .scopes import (
+    GLOBAL_SCOPE,
+    SCOPE_COLUMN_DEFAULTS,
+    SCOPE_COLUMNS,
+    ScopeManager,
+    clawteam_scopes_from_env,
+    parse_agent_id_from_session_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +106,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _TABLE_NAME = "memories"
-_EMBED_MODEL = "text-embedding-3-small"
-_EMBED_DIM = 1536
+_EMBED_MODEL = "text-embedding-3-small"  # legacy default; see embedders.make_embedder
+_EMBED_DIM = 1536  # legacy default; the schema is built from the active embedder's dim
 _TOP_K_VECTOR = 20
 _TOP_K_BM25 = 20
 _TOP_K_RETURN = 6
@@ -128,12 +154,12 @@ MEMORY_CATEGORIES = ["profile", "preferences", "entities", "events", "cases", "p
 # Schema
 # ---------------------------------------------------------------------------
 
-def _get_schema():
+def _get_schema(embed_dim: int = _EMBED_DIM):
     import pyarrow as pa
     return pa.schema([
         pa.field("id", pa.string()),
         pa.field("content", pa.string()),
-        pa.field("vector", pa.list_(pa.float32(), _EMBED_DIM)),
+        pa.field("vector", pa.list_(pa.float32(), embed_dim)),
         pa.field("timestamp", pa.float64()),
         pa.field("source", pa.string()),
         pa.field("session_id", pa.string()),
@@ -146,6 +172,12 @@ def _get_schema():
         pa.field("category", pa.string()),
         pa.field("abstract", pa.string()),
         pa.field("overview", pa.string()),
+        # v1.3.0 P1 — multi-scope columns (all nullable strings)
+        pa.field("agent_id", pa.string()),
+        pa.field("project_id", pa.string()),
+        pa.field("team_id", pa.string()),
+        pa.field("workspace_id", pa.string()),
+        pa.field("scope", pa.string()),
     ])
 
 
@@ -573,15 +605,21 @@ def _msg_text(msg: Dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Embedding client
+# Embedding client (legacy shim — kept for backward compatibility with tests
+# that monkey-patch `hermes_memory_lancedb._EmbedClient`. New code goes
+# through `hermes_memory_lancedb.embedders.make_embedder()`.)
 # ---------------------------------------------------------------------------
 
 class _EmbedClient:
+    """Legacy thin OpenAI embedder. Kept for back-compat with v1.1.0/v1.2.0 tests."""
+
     def __init__(self, api_key: str):
         from openai import OpenAI
         self._client = OpenAI(api_key=api_key)
         self._cache: Dict[str, List[float]] = {}
         self._lock = threading.Lock()
+        self.dimensions = _EMBED_DIM
+        self.model = _EMBED_MODEL
 
     def embed(self, text: str) -> List[float]:
         key = hashlib.md5(text.encode()).hexdigest()
@@ -671,9 +709,20 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
     def __init__(self):
         self._db = None
         self._table = None
-        self._embedder: Optional[_EmbedClient] = None
+        self._embedder: Optional[Embedder] = None
         self._llm: Optional[_LLMClient] = None
         self._user_id = "andrew"
+        # P1 scope identifiers (all optional; empty string == no filter)
+        self._agent_id: str = ""
+        self._project_id: str = ""
+        self._team_id: str = ""
+        self._workspace_id: str = ""
+        self._scope_manager: ScopeManager = ScopeManager()
+        # Tracks whether the active table has the new scope columns. Set
+        # during initialize() / _migrate_schema_if_needed() and consulted
+        # by _hybrid_search to choose between legacy and composable filters.
+        self._has_scope_columns: bool = True
+        self._embed_dim: int = _EMBED_DIM
         self._session_id = ""
         self._storage_path = ""
         self._extraction_model = _DEFAULT_EXTRACTION_MODEL
@@ -690,7 +739,8 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         return "lancedb"
 
     def is_available(self) -> bool:
-        return bool(os.environ.get("OPENAI_API_KEY"))
+        provider = get_provider_from_env()
+        return is_provider_available(provider)
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -739,6 +789,31 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._user_id = kwargs.get("user_id") or cfg.get("user_id", "andrew")
         self._extraction_model = cfg.get("extraction_model", _DEFAULT_EXTRACTION_MODEL)
 
+        # P1 scope identifiers (all optional). Read from kwargs first, then
+        # env vars (LANCEDB_AGENT_ID, LANCEDB_PROJECT_ID, etc.), else "".
+        self._agent_id = (
+            kwargs.get("agent_id") or os.environ.get("LANCEDB_AGENT_ID", "")
+            or parse_agent_id_from_session_key(session_id) or ""
+        )
+        self._project_id = kwargs.get("project_id") or os.environ.get("LANCEDB_PROJECT_ID", "")
+        self._team_id = kwargs.get("team_id") or os.environ.get("LANCEDB_TEAM_ID", "")
+        self._workspace_id = kwargs.get("workspace_id") or os.environ.get("LANCEDB_WORKSPACE_ID", "")
+
+        # Apply CLAWTEAM_MEMORY_SCOPE env extension (no-op if unset)
+        self._scope_manager = ScopeManager()
+        clawteam = clawteam_scopes_from_env()
+        if clawteam:
+            self._scope_manager.apply_clawteam_scopes(clawteam)
+
+        # Build the embedder via the multi-provider factory.
+        try:
+            self._embedder = make_embedder()
+            self._embed_dim = self._embedder.dimensions
+        except EmbeddingError as e:
+            logger.warning("LanceDB embedder init failed: %s", e)
+            self._ready = False
+            return
+
         try:
             import lancedb
 
@@ -749,18 +824,32 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 self._table = self._db.open_table(_TABLE_NAME)
                 self._migrate_schema_if_needed()
             else:
-                self._table = self._db.create_table(_TABLE_NAME, schema=_get_schema())
+                self._table = self._db.create_table(
+                    _TABLE_NAME, schema=_get_schema(self._embed_dim)
+                )
+                self._has_scope_columns = True
 
             try:
                 self._table.create_fts_index("content", replace=True)
             except Exception as e:
                 logger.debug("FTS index skipped: %s", e)
 
-            api_key = os.environ.get("OPENAI_API_KEY", "")
-            self._embedder = _EmbedClient(api_key)
-            self._llm = _LLMClient(api_key, model=self._extraction_model)
+            # LLM client still uses OpenAI for extraction/dedup.
+            llm_key = os.environ.get("OPENAI_API_KEY", "")
+            if llm_key:
+                self._llm = _LLMClient(llm_key, model=self._extraction_model)
+            else:
+                self._llm = None
+                logger.debug(
+                    "OPENAI_API_KEY not set — LLM extraction/dedup disabled (raw turn fallback only)"
+                )
             self._ready = True
-            logger.info("LanceDB memory v1.1.0 initialized at %s", self._storage_path)
+            logger.info(
+                "LanceDB memory v1.3.0 initialized at %s (provider=%s, dim=%d)",
+                self._storage_path,
+                get_provider_from_env(),
+                self._embed_dim,
+            )
 
             self.queue_prefetch("current targets prospects contacts plans tasks decisions")
 
@@ -773,7 +862,8 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return
         try:
             existing_cols = {f.name for f in self._table.schema}
-            new_fields = {
+            # v1.1.0 fields
+            v110_fields = {
                 "tier": "'peripheral'",
                 "importance": "0.5",
                 "access_count": "0",
@@ -781,12 +871,26 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 "abstract": "''",
                 "overview": "''",
             }
+            # v1.3.0 P1 — multi-scope columns
+            scope_fields = dict(SCOPE_COLUMN_DEFAULTS)
+            new_fields = {**v110_fields, **scope_fields}
             missing = {k: v for k, v in new_fields.items() if k not in existing_cols}
             if missing:
                 self._table.add_columns(missing)
                 logger.info("LanceDB schema migrated: added columns %s", list(missing.keys()))
+            # Determine whether scope columns are now present (either pre-existing
+            # or just-added). Used to choose between legacy `user_id`-only
+            # filtering and the composable scope filter.
+            updated_cols = {f.name for f in self._table.schema}
+            self._has_scope_columns = all(c in updated_cols for c in SCOPE_COLUMNS)
         except Exception as e:
             logger.warning("LanceDB schema migration failed (reads will use defaults): %s", e)
+            # Be conservative — without confirmed migration, assume legacy schema.
+            try:
+                cols = {f.name for f in self._table.schema}
+                self._has_scope_columns = all(c in cols for c in SCOPE_COLUMNS)
+            except Exception:
+                self._has_scope_columns = False
 
     def system_prompt_block(self) -> str:
         if not self._ready:
@@ -825,24 +929,33 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="lancedb-prefetch")
         self._prefetch_thread.start()
 
+    def _build_scope_where(self) -> str:
+        """Compose the SQL WHERE predicate for the active scope identifiers."""
+        return self._scope_manager.build_where_clause(
+            agent_id=self._agent_id or None,
+            user_id=self._user_id or None,
+            project_id=self._project_id or None,
+            team_id=self._team_id or None,
+            workspace_id=self._workspace_id or None,
+            scope_columns_present=self._has_scope_columns,
+            legacy_user_id=self._user_id or None,
+        )
+
     def _hybrid_search(self, query: str, top_k: int = _TOP_K_RETURN) -> List[Dict]:
         if not self._ready or self._table is None or self._embedder is None:
             return []
         try:
             vec = self._embedder.embed(query)
-            v_results = (
-                self._table.search(vec, vector_column_name="vector")
-                .where(f"user_id = '{self._user_id}'", prefilter=True)
-                .limit(_TOP_K_VECTOR)
-                .to_list()
-            )
+            where_clause = self._build_scope_where()
+            v_search = self._table.search(vec, vector_column_name="vector")
+            if where_clause:
+                v_search = v_search.where(where_clause, prefilter=True)
+            v_results = v_search.limit(_TOP_K_VECTOR).to_list()
             try:
-                b_results = (
-                    self._table.search(query, query_type="fts")
-                    .where(f"user_id = '{self._user_id}'", prefilter=True)
-                    .limit(_TOP_K_BM25)
-                    .to_list()
-                )
+                b_search = self._table.search(query, query_type="fts")
+                if where_clause:
+                    b_search = b_search.where(where_clause, prefilter=True)
+                b_results = b_search.limit(_TOP_K_BM25).to_list()
             except Exception:
                 b_results = []
 
@@ -977,12 +1090,11 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return None
         try:
             vec = self._embedder.embed(text)
-            results = (
-                self._table.search(vec, vector_column_name="vector")
-                .where(f"user_id = '{self._user_id}'", prefilter=True)
-                .limit(1)
-                .to_list()
-            )
+            where_clause = self._build_scope_where()
+            search = self._table.search(vec, vector_column_name="vector")
+            if where_clause:
+                search = search.where(where_clause, prefilter=True)
+            results = search.limit(1).to_list()
             if results and results[0].get("_distance", 999) < threshold:
                 return results[0]
         except Exception:
@@ -998,7 +1110,7 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 text = entry.get("content", "")
                 if not text.strip():
                     continue
-                rows.append({
+                row = {
                     "id": str(uuid.uuid4()),
                     "content": text,
                     "vector": self._embedder.embed(text),
@@ -1013,7 +1125,25 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     "category": entry.get("category", "general"),
                     "abstract": entry.get("abstract", ""),
                     "overview": entry.get("overview", ""),
-                })
+                }
+                # P1 — populate scope columns when present.
+                if self._has_scope_columns:
+                    row["agent_id"] = entry.get("agent_id", self._agent_id) or ""
+                    row["project_id"] = entry.get("project_id", self._project_id) or ""
+                    row["team_id"] = entry.get("team_id", self._team_id) or ""
+                    row["workspace_id"] = entry.get("workspace_id", self._workspace_id) or ""
+                    # Default canonical scope: agent's private scope if known,
+                    # else user, else global.
+                    canonical = entry.get("scope")
+                    if not canonical:
+                        if row["agent_id"]:
+                            canonical = f"agent:{row['agent_id']}"
+                        elif row["user_id"]:
+                            canonical = f"user:{row['user_id']}"
+                        else:
+                            canonical = GLOBAL_SCOPE
+                    row["scope"] = canonical
+                rows.append(row)
             if rows:
                 self._table.add(rows)
         except Exception as e:
@@ -1294,12 +1424,11 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             if not self._ready or self._table is None:
                 return json.dumps({"error": "memory not ready"})
             try:
-                rows = (
-                    self._table.search()
-                    .where(f"user_id = '{self._user_id}'", prefilter=True)
-                    .limit(10000)
-                    .to_list()
-                )
+                where_clause = self._build_scope_where()
+                search = self._table.search()
+                if where_clause:
+                    search = search.where(where_clause, prefilter=True)
+                rows = search.limit(10000).to_list()
                 total = len(rows)
                 tiers: Dict[str, int] = {}
                 cats: Dict[str, int] = {}
@@ -1326,4 +1455,20 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         logger.info("LanceDB memory shut down.")
 
 
-__all__ = ["LanceDBMemoryProvider"]
+__all__ = [
+    "LanceDBMemoryProvider",
+    # P1 re-exports for downstream consumers and tests
+    "Embedder",
+    "EmbeddingError",
+    "ScopeManager",
+    "make_embedder",
+    "get_provider_from_env",
+    "is_provider_available",
+    "EMBEDDING_DIMENSIONS",
+    "PROVIDER_DEFAULT_MODEL",
+    "GLOBAL_SCOPE",
+    "SCOPE_COLUMNS",
+    "SCOPE_COLUMN_DEFAULTS",
+    "parse_agent_id_from_session_key",
+    "clawteam_scopes_from_env",
+]

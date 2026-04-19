@@ -1,10 +1,17 @@
 # hermes-memory-lancedb
 
-LanceDB-backed persistent memory for [Hermes Agent](https://github.com/TheophilusChinomona/hermes-agent) (Athena fork). Hybrid BM25 + vector recall, cross-encoder reranking, MMR diversity, three-tier lifecycle, and LLM smart extraction with dedup.
+LanceDB-backed persistent memory for [Hermes Agent](https://github.com/TheophilusChinomona/hermes-agent) (Athena fork). Hybrid BM25 + vector recall, cross-encoder reranking, MMR diversity, three-tier lifecycle, multi-provider embeddings, multi-scope isolation, and LLM smart extraction with dedup.
 
 This is the Python port of [memory-lancedb-pro](https://github.com/TheophilusChinomona/memory-lancedb-pro) (TypeScript). Drop-in for the bundled `lancedb` plugin in Athena's `plugins/memory/lancedb/`.
 
 ## Features
+
+**Multi-tenancy (v1.3.0)**
+- Multi-scope isolation: `agent_id`, `user_id`, `project_id`, `team_id`, `workspace_id` columns compose orthogonally in the search predicate
+- Built-in scope patterns (`agent:*`, `user:*`, `project:*`, `team:*`, `workspace:*`, `custom:*`, `reflection:*`) plus the `global` scope
+- ClawTeam shared scopes via `CLAWTEAM_MEMORY_SCOPE` env var (CSV)
+- Multi-provider embeddings: OpenAI (default), Jina, Gemini, Ollama, plus any OpenAI-compatible endpoint via `LANCEDB_EMBED_BASE_URL`. Vector dimension is provider-driven and persisted in the schema.
+- Backward compatible: legacy tables without scope columns automatically migrate; reads still scope to `user_id` until migration completes.
 
 **Retrieval pipeline (v1.2.0)**
 - Hybrid search: parallel vector (cosine, OpenAI `text-embedding-3-small`) + BM25 (tantivy)
@@ -58,8 +65,18 @@ The bundled plugin shim at `plugins/memory/lancedb/__init__.py` (in `hermes-agen
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | required | Embeddings (`text-embedding-3-small`) and LLM extraction (`gpt-4o-mini`) |
+| `OPENAI_API_KEY` | required for default provider | OpenAI embeddings + LLM extraction (`gpt-4o-mini`) |
 | `LANCEDB_PATH` | `$HERMES_HOME/lancedb` | Storage directory |
+| `LANCEDB_EMBED_PROVIDER` | `openai` | One of `openai` / `jina` / `gemini` / `ollama` / `openai-compatible` |
+| `LANCEDB_EMBED_MODEL` | provider default | Override embedding model id |
+| `LANCEDB_EMBED_DIM` | from model id | Explicit embedding dimension override |
+| `LANCEDB_EMBED_BASE_URL` | unset | Custom base URL (required for `openai-compatible`) |
+| `LANCEDB_EMBED_API_KEY` | unset | Generic key override (otherwise reads provider-specific keys) |
+| `JINA_API_KEY` | unset | Required for Jina embeddings |
+| `GEMINI_API_KEY` | unset | Required for Gemini embeddings |
+| `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama server base URL |
+| `LANCEDB_AGENT_ID` / `LANCEDB_PROJECT_ID` / `LANCEDB_TEAM_ID` / `LANCEDB_WORKSPACE_ID` | unset | Scope identifiers (compose orthogonally) |
+| `CLAWTEAM_MEMORY_SCOPE` | unset | CSV of extra scopes granted to every agent |
 | `LANCEDB_RERANK_PROVIDER` | `auto` | `auto` (Jina if key set, else cosine) or `none` to skip rerank |
 | `LANCEDB_RERANK_API_KEY` / `JINA_API_KEY` | unset | Enables Jina cross-encoder rerank |
 | `LANCEDB_RERANK_MODEL` | `jina-reranker-v3` | Jina model name |
@@ -85,7 +102,7 @@ Single LanceDB table `memories` with FTS index on `content`:
 | --- | --- | --- |
 | `id` | string | UUID |
 | `content` | string | Full narrative (≤2000 chars) |
-| `vector` | fixed_size_list<float, 1536> | text-embedding-3-small |
+| `vector` | fixed_size_list<float, _N_> | _N_ = active embedder's dimension (default 1536 for OpenAI 3-small) |
 | `timestamp` | float64 | Unix epoch |
 | `source` | string | e.g. `discord:dm:<id>` |
 | `session_id` | string | Hermes session id at write time |
@@ -97,6 +114,11 @@ Single LanceDB table `memories` with FTS index on `content`:
 | `category` | string | One of `MEMORY_CATEGORIES` |
 | `abstract` | string | L0, ≤80 chars |
 | `overview` | string | L1, ≤800 chars bullets |
+| `agent_id` | string | P1 — empty if not scoped per-agent |
+| `project_id` | string | P1 — composable column filter |
+| `team_id` | string | P1 — composable column filter |
+| `workspace_id` | string | P1 — composable column filter |
+| `scope` | string | P1 — canonical scope id (e.g. `agent:andrew`) |
 
 ## Tools exposed to the agent
 
@@ -121,7 +143,7 @@ pytest tests/
 | Phase | Status |
 | --- | --- |
 | P0 — Cross-encoder rerank, MMR, length norm, hard min-score | Done (v1.2.0) |
-| P1 — Multi-scope (agent/user/project/team), multi-provider embeddings (Jina/Gemini/Ollama) | Pending |
+| P1 — Multi-scope (agent/user/project/team/workspace), multi-provider embeddings (Jina/Gemini/Ollama) | Done (v1.3.0) |
 | P2 — Chunker, batch dedup, admission control, smart metadata, noise prototypes | Pending |
 | P3 — Reflection subsystem (event store, item store, ranking, retry, slices) | Pending |
 | P4 — Session compactor, memory compactor, temporal classifier, auto-capture cleanup, query expansion | Pending |
