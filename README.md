@@ -6,6 +6,15 @@ This is the Python port of [memory-lancedb-pro](https://github.com/TheophilusChi
 
 ## Features
 
+**Lifecycle & ops (v1.6.0 — P4)**
+- `TierManager` + `DecayEngine` extracted into `lifecycle.py` with importance-modulated half-life and `apply_search_boost`
+- Temporal classifier: `static` vs `dynamic` memories; dynamic ones decay 3x faster
+- Session compressor: end-of-session summary written as a single dense entry
+- Session recovery: re-inflate compressed entries when a session_id reopens
+- Memory compactor: clusters near-duplicates (cosine ≥ 0.88) and merges them; auto-trigger every N writes plus a `lancedb_compact` tool
+- Auto-capture cleanup at session start: deletes/demotes the previous session's noisy auto-captures
+- Intent analyzer + query expansion: rule-based pre-search routing + BM25 fan-out across synonyms
+
 **Retrieval pipeline (v1.2.0)**
 - Hybrid search: parallel vector (cosine, OpenAI `text-embedding-3-small`) + BM25 (tantivy)
 - RRF fusion → score normalization → tier/recency boost
@@ -66,6 +75,7 @@ The bundled plugin shim at `plugins/memory/lancedb/__init__.py` (in `hermes-agen
 | `LANCEDB_RERANK_ENDPOINT` | `https://api.jina.ai/v1/rerank` | Jina-compatible endpoint |
 | `LANCEDB_RERANK_TIMEOUT_S` | `5.0` | Rerank API timeout in seconds |
 | `LANCEDB_HARD_MIN_SCORE` | `0.35` | Final score cutoff after pipeline |
+| `LANCEDB_COMPACT_EVERY_N` | `100` | Auto-trigger memory compaction every N writes (P4) |
 
 Persistent config in `$HERMES_HOME/lancedb.json`:
 
@@ -97,15 +107,17 @@ Single LanceDB table `memories` with FTS index on `content`:
 | `category` | string | One of `MEMORY_CATEGORIES` |
 | `abstract` | string | L0, ≤80 chars |
 | `overview` | string | L1, ≤800 chars bullets |
+| `temporal_type` | string | `static` (default) or `dynamic` (decays 3x faster, P4) |
 
 ## Tools exposed to the agent
 
 | Tool | Purpose |
 | --- | --- |
-| `lancedb_search` | Hybrid retrieval, returns markdown bullets |
+| `lancedb_search` | Hybrid retrieval (intent-routed, query-expanded), returns markdown bullets |
 | `lancedb_remember` | Explicit write of a durable fact |
 | `lancedb_forget` | Soft-delete by id |
 | `lancedb_stats` | Counts per tier / category, storage path |
+| `lancedb_compact` | Cluster + merge near-duplicate memories (also auto-runs every N writes) |
 
 ## Tests
 
@@ -124,7 +136,7 @@ pytest tests/
 | P1 — Multi-scope (agent/user/project/team), multi-provider embeddings (Jina/Gemini/Ollama) | Pending |
 | P2 — Chunker, batch dedup, admission control, smart metadata, noise prototypes | Pending |
 | P3 — Reflection subsystem (event store, item store, ranking, retry, slices) | Pending |
-| P4 — Session compactor, memory compactor, temporal classifier, auto-capture cleanup, query expansion | Pending |
+| P4 — Lifecycle module (TierManager + DecayEngine), temporal classifier, session compressor + recovery, memory compactor, auto-capture cleanup, intent + query expansion | Done (v1.6.0) |
 | P5 — Management CLI, retrieval observability, markdown import, A/B reembed | Pending |
 
 OAuth is intentionally out of scope — `OPENAI_API_KEY` and (optionally) `JINA_API_KEY` are sufficient.
