@@ -1,6 +1,21 @@
-"""hermes-memory-lancedb v1.2.0 — LanceDB vector memory plugin for Hermes agents.
+"""hermes-memory-lancedb v1.4.0 — LanceDB vector memory plugin for Hermes agents.
 
 Hybrid BM25 + vector recall, Weibull decay, OpenAI text-embedding-3-small.
+
+v1.4.0 additions (P2 of memory-lancedb-pro port — write pipeline):
+  - Long-context chunker: split oversized writes on sentence boundaries with
+    overlap; chunks share a `parent_id` so retrieval can collapse them
+  - Batch dedup: pairwise cosine within a candidate batch + a single LLM call
+    over surviving candidates vs the existing pool (was 1 LLM call per pair)
+  - Admission control: rolling acceptance-rate / novelty / recency / type-prior
+    gate with a hard-reject cosine vs recent rejects; persists stats to
+    `<storage_path>/admission_stats.json`
+  - Smart metadata: per-write LLM extraction of memory_temporal_type,
+    confidence, sensitivity, modality, fact_key, tags — JSON-encoded into a
+    new `metadata` column
+  - Noise prototype filter: ~20 bundled multilingual noise prototypes; rejects
+    writes whose embedding has cosine >= 0.92 with any prototype. Combined
+    with the existing regex filter (either matcher rejects)
 
 v1.2.0 additions (P0 of memory-lancedb-pro port — retrieval quality):
   - Cross-encoder reranking via Jina (fallback: cosine of query vs doc vectors)
@@ -40,6 +55,13 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# v1.4.0 (P2) modules
+from .chunker import chunk_text  # noqa: E402
+from .dedup import batch_dedup  # noqa: E402
+from .admission import AdmissionController  # noqa: E402
+from .smart_metadata import extract_smart_metadata, stringify_smart_metadata  # noqa: E402
+from .noise_proto import NoisePrototypeFilter  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # MemoryProvider base
@@ -123,6 +145,13 @@ _DEMO_AGE_ACCESS_THRESHOLD = 3
 
 MEMORY_CATEGORIES = ["profile", "preferences", "entities", "events", "cases", "patterns"]
 
+# v1.4.0 P2 — write-pipeline tuning
+_CHUNK_TRIGGER_CHARS = 1800   # split contents longer than this into chunks
+_CHUNK_MAX_CHARS = 1500
+_CHUNK_OVERLAP = 200
+_BATCH_DEDUP_POOL_SIZE = 6     # how many existing memories to surface per candidate
+_NOISE_PROTO_THRESHOLD = 0.92  # cosine >= this => noise (matches TS)
+
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -146,6 +175,9 @@ def _get_schema():
         pa.field("category", pa.string()),
         pa.field("abstract", pa.string()),
         pa.field("overview", pa.string()),
+        # v1.4.0 P2 fields
+        pa.field("metadata", pa.string()),   # JSON-encoded smart metadata
+        pa.field("parent_id", pa.string()),  # links chunked rows to their source
     ])
 
 
@@ -684,6 +716,10 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._extract_queue: List[Dict] = []
         self._extract_lock = threading.Lock()
         self._extract_thread: Optional[threading.Thread] = None
+        # v1.4.0 P2 — admission control + noise prototype filter
+        self._admission: Optional[AdmissionController] = None
+        self._noise_proto: Optional[NoisePrototypeFilter] = None
+        self._smart_metadata_enabled: bool = True
 
     @property
     def name(self) -> str:
@@ -759,8 +795,26 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             api_key = os.environ.get("OPENAI_API_KEY", "")
             self._embedder = _EmbedClient(api_key)
             self._llm = _LLMClient(api_key, model=self._extraction_model)
+
+            # v1.4.0 P2: admission controller + noise prototype filter.
+            # Both default ON; flip via env vars to disable for tests/CI.
+            admission_enabled = os.environ.get(
+                "LANCEDB_ADMISSION_ENABLED", "1"
+            ).lower() not in ("0", "false", "no")
+            self._admission = AdmissionController(
+                self._storage_path, enabled=admission_enabled,
+            )
+            self._smart_metadata_enabled = os.environ.get(
+                "LANCEDB_SMART_METADATA", "1"
+            ).lower() not in ("0", "false", "no")
+            self._noise_proto = NoisePrototypeFilter(self._storage_path)
+            try:
+                self._noise_proto.load_or_init(self._embedder.embed)
+            except Exception as e:
+                logger.debug("noise prototype init skipped: %s", e)
+
             self._ready = True
-            logger.info("LanceDB memory v1.1.0 initialized at %s", self._storage_path)
+            logger.info("LanceDB memory v1.4.0 initialized at %s", self._storage_path)
 
             self.queue_prefetch("current targets prospects contacts plans tasks decisions")
 
@@ -774,12 +828,16 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         try:
             existing_cols = {f.name for f in self._table.schema}
             new_fields = {
+                # v1.1.0
                 "tier": "'peripheral'",
                 "importance": "0.5",
                 "access_count": "0",
                 "category": "'general'",
                 "abstract": "''",
                 "overview": "''",
+                # v1.4.0 P2
+                "metadata": "''",
+                "parent_id": "''",
             }
             missing = {k: v for k, v in new_fields.items() if k not in existing_cols}
             if missing:
@@ -989,6 +1047,30 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             pass
         return None
 
+    def _is_vector_noise(self, vec: List[float]) -> bool:
+        """Vector-level noise check via the prototype bank (P2)."""
+        if not self._noise_proto or not self._noise_proto.initialized:
+            return False
+        try:
+            return self._noise_proto.is_noise(vec, threshold=_NOISE_PROTO_THRESHOLD)
+        except Exception:
+            return False
+
+    def _should_admit(self, text: str, vec: List[float], category: str) -> Tuple[bool, str]:
+        """Combined admission check: regex noise OR vector noise OR admission gate.
+
+        Returns (admit, reason). Reason is empty when admitted.
+        """
+        if _is_noise(text):
+            return False, "regex noise filter"
+        if vec and self._is_vector_noise(vec):
+            return False, "noise prototype match"
+        if self._admission and self._admission.enabled:
+            decision = self._admission.evaluate(text, vec, category=category)
+            if not decision.admit:
+                return False, f"admission control: {decision.reason}"
+        return True, ""
+
     def _write_entries(self, entries: List[Dict]) -> None:
         if not self._ready or not entries or self._table is None or self._embedder is None:
             return
@@ -998,22 +1080,78 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 text = entry.get("content", "")
                 if not text.strip():
                     continue
-                rows.append({
-                    "id": str(uuid.uuid4()),
-                    "content": text,
-                    "vector": self._embedder.embed(text),
-                    "timestamp": entry.get("timestamp", time.time()),
-                    "source": entry.get("source", "turn"),
-                    "session_id": entry.get("session_id", self._session_id),
-                    "user_id": entry.get("user_id", self._user_id),
-                    "tags": json.dumps(entry.get("tags", [])),
-                    "tier": entry.get("tier", "peripheral"),
-                    "importance": float(entry.get("importance", 0.5)),
-                    "access_count": int(entry.get("access_count", 0)),
-                    "category": entry.get("category", "general"),
-                    "abstract": entry.get("abstract", ""),
-                    "overview": entry.get("overview", ""),
-                })
+
+                # P2: chunk long content. Each chunk shares a parent_id.
+                pieces: List[Tuple[str, str]] = []
+                if len(text) > _CHUNK_TRIGGER_CHARS:
+                    chunks = chunk_text(text, _CHUNK_MAX_CHARS, _CHUNK_OVERLAP)
+                    parent_id = str(uuid.uuid4())
+                    for chunk in chunks:
+                        pieces.append((chunk, parent_id))
+                else:
+                    pieces.append((text, entry.get("parent_id", "")))
+
+                category = entry.get("category", "general")
+                source = entry.get("source", "turn")
+                base_metadata_obj = entry.get("metadata")
+                if isinstance(base_metadata_obj, dict):
+                    base_metadata_str = stringify_smart_metadata(base_metadata_obj)
+                elif isinstance(base_metadata_obj, str):
+                    base_metadata_str = base_metadata_obj
+                else:
+                    base_metadata_str = ""
+
+                for chunk_text_value, parent_id in pieces:
+                    vec = self._embedder.embed(chunk_text_value)
+
+                    # P2: gate via combined noise + admission check (skipped for
+                    # explicit `lancedb_remember` writes — those are user intent).
+                    if source not in ("explicit",):
+                        admit, reason = self._should_admit(chunk_text_value, vec, category)
+                        if not admit:
+                            logger.debug("LanceDB write skipped: %s", reason)
+                            continue
+
+                    # P2: smart metadata. If caller supplied one we keep it,
+                    # otherwise extract on the fly when LLM is wired up.
+                    metadata_str = base_metadata_str
+                    if (
+                        not metadata_str
+                        and self._smart_metadata_enabled
+                        and self._llm is not None
+                    ):
+                        try:
+                            meta = extract_smart_metadata(
+                                chunk_text_value,
+                                self._llm,
+                                abstract=entry.get("abstract", ""),
+                                category=category,
+                                source="manual" if source == "explicit" else "auto-capture",
+                                timestamp=entry.get("timestamp", time.time()),
+                            )
+                            metadata_str = stringify_smart_metadata(meta)
+                        except Exception as e:
+                            logger.debug("smart metadata extraction failed: %s", e)
+                            metadata_str = ""
+
+                    rows.append({
+                        "id": str(uuid.uuid4()),
+                        "content": chunk_text_value,
+                        "vector": vec,
+                        "timestamp": entry.get("timestamp", time.time()),
+                        "source": source,
+                        "session_id": entry.get("session_id", self._session_id),
+                        "user_id": entry.get("user_id", self._user_id),
+                        "tags": json.dumps(entry.get("tags", [])),
+                        "tier": entry.get("tier", "peripheral"),
+                        "importance": float(entry.get("importance", 0.5)),
+                        "access_count": int(entry.get("access_count", 0)),
+                        "category": category,
+                        "abstract": entry.get("abstract", ""),
+                        "overview": entry.get("overview", ""),
+                        "metadata": metadata_str,
+                        "parent_id": parent_id,
+                    })
             if rows:
                 self._table.add(rows)
         except Exception as e:
@@ -1046,47 +1184,69 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 }])
             return
 
-        for candidate in candidates:
+        # P2: build an existing-pool from a single vector probe per candidate,
+        # then run ONE batch dedup LLM call instead of N pairwise calls.
+        existing_pool: List[Dict] = []
+        candidate_to_match: Dict[int, Dict] = {}
+        for idx, candidate in enumerate(candidates):
+            content = candidate.get("content", "")
+            if not content.strip():
+                continue
+            similar = self._find_similar(content)
+            if similar:
+                candidate_to_match[idx] = similar
+                # Add to pool if not already present
+                if not any(p.get("id") == similar.get("id") for p in existing_pool):
+                    existing_pool.append(similar)
+                if len(existing_pool) >= _BATCH_DEDUP_POOL_SIZE:
+                    break
+
+        embed_fn = self._embedder.embed if self._embedder else None
+        decisions = batch_dedup(
+            candidates,
+            existing_pool,
+            self._llm,
+            embedder=embed_fn,
+        )
+        decisions_by_index = {d["index"]: d for d in decisions}
+
+        for idx, candidate in enumerate(candidates):
             content = candidate.get("content", "")
             if not content.strip():
                 continue
 
-            similar = self._find_similar(content)
+            d = decisions_by_index.get(idx, {"decision": "create", "merged_content": ""})
+            decision = d.get("decision", "create")
+            merged = d.get("merged_content") or ""
+            similar = candidate_to_match.get(idx)
 
-            if similar:
-                decision, merged = _llm_dedup(
-                    similar.get("content", ""),
-                    content,
-                    self._llm,
-                )
+            if decision in ("skip", "support"):
+                continue
 
-                if decision in ("skip", "support"):
-                    continue
+            if decision == "supersede" and similar and similar.get("id"):
+                try:
+                    self._table.delete(f"id = '{similar['id']}'")
+                except Exception:
+                    pass
+                self._write_entries([{**candidate, "source": "extraction", "timestamp": time.time(),
+                                      "session_id": turn_data.get("session_id", self._session_id)}])
+                continue
 
-                if decision == "supersede" and similar.get("id"):
+            if decision == "merge" and merged and similar:
+                if similar.get("id"):
                     try:
                         self._table.delete(f"id = '{similar['id']}'")
                     except Exception:
                         pass
-                    self._write_entries([{**candidate, "source": "extraction", "timestamp": time.time(),
-                                          "session_id": turn_data.get("session_id", self._session_id)}])
-                    continue
+                candidate["content"] = merged
+                candidate["abstract"] = candidate.get("abstract", merged[:80])
+                self._write_entries([{**candidate, "source": "extraction_merge", "timestamp": time.time(),
+                                      "session_id": turn_data.get("session_id", self._session_id)}])
+                continue
 
-                if decision == "merge" and merged:
-                    if similar.get("id"):
-                        try:
-                            self._table.delete(f"id = '{similar['id']}'")
-                        except Exception:
-                            pass
-                    candidate["content"] = merged
-                    candidate["abstract"] = candidate.get("abstract", merged[:80])
-                    self._write_entries([{**candidate, "source": "extraction_merge", "timestamp": time.time(),
-                                          "session_id": turn_data.get("session_id", self._session_id)}])
-                    continue
-
-                if decision == "contradict":
-                    # Store with a conflict marker
-                    candidate["abstract"] = f"[CONFLICT] {candidate.get('abstract', '')}"
+            if decision == "contradict":
+                # Store with a conflict marker
+                candidate["abstract"] = f"[CONFLICT] {candidate.get('abstract', '')}"
 
             self._write_entries([{**candidate, "source": "extraction", "timestamp": time.time(),
                                    "session_id": turn_data.get("session_id", self._session_id)}])
@@ -1326,4 +1486,14 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         logger.info("LanceDB memory shut down.")
 
 
-__all__ = ["LanceDBMemoryProvider"]
+__all__ = [
+    "LanceDBMemoryProvider",
+    "MEMORY_CATEGORIES",
+    # P2 modules re-exported for convenience
+    "AdmissionController",
+    "NoisePrototypeFilter",
+    "batch_dedup",
+    "chunk_text",
+    "extract_smart_metadata",
+    "stringify_smart_metadata",
+]
