@@ -1,10 +1,18 @@
 # hermes-memory-lancedb
 
-LanceDB-backed persistent memory for [Hermes Agent](https://github.com/TheophilusChinomona/hermes-agent) (Athena fork). Hybrid BM25 + vector recall, cross-encoder reranking, MMR diversity, three-tier lifecycle, and LLM smart extraction with dedup.
+LanceDB-backed persistent memory for [Hermes Agent](https://github.com/TheophilusChinomona/hermes-agent) (Athena fork). Hybrid BM25 + vector recall, cross-encoder reranking, MMR diversity, three-tier lifecycle, LLM smart extraction with dedup, plus a management CLI and per-query observability.
 
 This is the Python port of [memory-lancedb-pro](https://github.com/TheophilusChinomona/memory-lancedb-pro) (TypeScript). Drop-in for the bundled `lancedb` plugin in Athena's `plugins/memory/lancedb/`.
 
 ## Features
+
+**Management & observability (v1.7.0)**
+- Console CLI: `hermes-memory-lancedb {list,search,stats,delete,delete-bulk,export,import,import-markdown,reembed,migrate,reindex-fts,version}`
+- Per-query `RetrievalTrace` records timings, score ranges, and dropped IDs at every pipeline stage
+- Rolling `RetrievalStats` ring buffer aggregates queries-by-source, p95 latency, top drop stages, and result-count histograms
+- Markdown ingest for `MEMORY.md` and dated `memory/YYYY-MM-DD.md` files
+- A/B re-embedding via `reembed --target /path/to/alt.db` for embedder upgrades
+- `portalocker` cross-process file lock around writes, schema migrations, and FTS reindex so multiple Hermes processes can share one LanceDB safely
 
 **Retrieval pipeline (v1.2.0)**
 - Hybrid search: parallel vector (cosine, OpenAI `text-embedding-3-small`) + BM25 (tantivy)
@@ -38,10 +46,10 @@ pip install "hermes-memory-lancedb @ git+https://github.com/TheophilusChinomona/
 Or pin to a tag:
 
 ```bash
-pip install "hermes-memory-lancedb @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@v1.2.0"
+pip install "hermes-memory-lancedb @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@v1.7.0"
 ```
 
-Runtime requirements: Python ≥ 3.10, `lancedb ≥ 0.20`, `tantivy ≥ 0.21`, `openai ≥ 1.0`, `pyarrow ≥ 12`, `httpx` (transitively via `openai`).
+Runtime requirements: Python ≥ 3.10, `lancedb ≥ 0.20`, `tantivy ≥ 0.21`, `openai ≥ 1.0`, `pyarrow ≥ 12`, `click ≥ 8.0`, `portalocker ≥ 2.7`, `httpx` (transitively via `openai`).
 
 ## Activate in Hermes
 
@@ -107,6 +115,58 @@ Single LanceDB table `memories` with FTS index on `content`:
 | `lancedb_forget` | Soft-delete by id |
 | `lancedb_stats` | Counts per tier / category, storage path |
 
+## CLI
+
+Installing the package registers a `hermes-memory-lancedb` console script (also runnable as `python -m hermes_memory_lancedb.cli`). All commands accept `--storage-path` and `--user-id` at the top level.
+
+| Command | Purpose |
+| --- | --- |
+| `version` | Print the package version |
+| `list [--limit N] [--tier TIER] [--category CAT] [--json]` | List entries |
+| `search <query> [--limit N] [--trace] [--json]` | Hybrid search via the existing pipeline |
+| `stats [--json]` | Counts per tier/category, storage path, table size, retrieval stats |
+| `delete <id>` | Delete one entry by id |
+| `delete-bulk --ids <id1,id2,...>` or `--filter "tier='peripheral'"` | Bulk delete (supports `--dry-run`) |
+| `export [--format json\|jsonl] [--out FILE]` | Dump all entries |
+| `import <file> [--dry-run]` | Load entries from JSON or JSONL |
+| `import-markdown [GLOB...] [--base-dir DIR] [--dry-run]` | Ingest `MEMORY.md` / `memory/YYYY-MM-DD.md` files |
+| `reembed [--target PATH] [--dry-run] [--batch-size N]` | Re-embed all entries; `--target` writes to a parallel DB for A/B retrieval comparison |
+| `migrate check\|run\|verify` | Schema migration ops |
+| `reindex-fts` | Drop and rebuild the FTS index |
+
+Examples:
+
+```bash
+# Show what's in the store
+hermes-memory-lancedb list --tier core --limit 50
+
+# Inspect a search end-to-end with the per-query pipeline trace
+hermes-memory-lancedb search "andrew leeds plumbing" --trace
+
+# A/B compare embedders by re-embedding into a parallel DB
+hermes-memory-lancedb reembed --target ~/.hermes/lancedb-jina
+
+# Pull MEMORY.md into the store from any directory
+hermes-memory-lancedb import-markdown 'docs/**/*.md' --base-dir .
+
+# Run schema migrations (e.g. after upgrading)
+hermes-memory-lancedb migrate run
+```
+
+Both `LanceDBMemoryProvider._hybrid_search` and the CLI `search` command accept an optional `RetrievalTrace`. Pass one in to capture per-stage timings, score ranges, and dropped IDs:
+
+```python
+from hermes_memory_lancedb import LanceDBMemoryProvider, RetrievalTrace
+provider = LanceDBMemoryProvider()
+provider.initialize("session")
+trace = RetrievalTrace()
+hits = provider._hybrid_search("hello", top_k=5, trace=trace)
+print(trace.summarize())
+print(provider.get_stats())  # rolling aggregate over the last 1000 queries
+```
+
+Concurrent writers (multiple Hermes processes sharing the same LanceDB) are made safe by an exclusive `portalocker` file lock around `_write_entries`, schema migrations, and `reindex-fts`. The lock file lives next to the table directory at `<storage_path>/memories.lock`.
+
 ## Tests
 
 ```bash
@@ -114,7 +174,7 @@ pip install -e ".[dev]"
 pytest tests/
 ```
 
-84 unit tests cover noise filtering, decay, RRF fusion, tier evaluation, LLM extraction, dedup, prompt builders, and the v1.2.0 retrieval helpers (length norm, MMR, rerank, cosine). Tests that touch the LanceDB native runtime are gated behind a real `lancedb` import — skip them on CPUs without AVX support.
+138+ unit tests cover noise filtering, decay, RRF fusion, tier evaluation, LLM extraction, dedup, prompt builders, the v1.2.0 retrieval helpers (length norm, MMR, rerank, cosine), the v1.7.0 management CLI (via `click.testing.CliRunner`), `RetrievalTrace`/`RetrievalStats` aggregation, the markdown parser, and the file-lock context manager. Tests that touch the LanceDB native runtime are gated behind a real `lancedb` import — skip them on CPUs without AVX support.
 
 ## Status
 
@@ -125,6 +185,6 @@ pytest tests/
 | P2 — Chunker, batch dedup, admission control, smart metadata, noise prototypes | Pending |
 | P3 — Reflection subsystem (event store, item store, ranking, retry, slices) | Pending |
 | P4 — Session compactor, memory compactor, temporal classifier, auto-capture cleanup, query expansion | Pending |
-| P5 — Management CLI, retrieval observability, markdown import, A/B reembed | Pending |
+| P5 — Management CLI, retrieval observability, markdown import, A/B reembed, file locking | Done (v1.7.0) |
 
 OAuth is intentionally out of scope — `OPENAI_API_KEY` and (optionally) `JINA_API_KEY` are sufficient.

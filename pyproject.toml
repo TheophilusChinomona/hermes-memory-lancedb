@@ -4,18 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-memory-lancedb"
-version = "1.2.0"
-description = "LanceDB vector memory plugin for Hermes agents — cross-encoder rerank, MMR diversity, length norm, LLM Smart Extraction, 3-tier memory, dedup pipeline, hybrid BM25+vector recall"
+version = "1.7.0"
+description = "LanceDB vector memory plugin for Hermes agents — management CLI, observability, markdown import, A/B reembed, file locking; cross-encoder rerank, MMR diversity, length norm, LLM Smart Extraction, 3-tier memory, dedup pipeline, hybrid BM25+vector recall"
 requires-python = ">=3.10"
 dependencies = [
     "lancedb>=0.20.0",
     "tantivy>=0.21.0",
     "openai>=1.0.0",
     "pyarrow>=12.0.0",
+    "click>=8.0.0",
+    "portalocker>=2.7.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+hermes-memory-lancedb = "hermes_memory_lancedb.cli:main"
 
 [project.urls]
 Repository = "https://github.com/TheophilusChinomona/hermes-memory-lancedb"
