@@ -23,7 +23,7 @@ import unittest
 from typing import List
 from unittest.mock import MagicMock
 
-from hermes_memory_lancedb import (
+from athena_memory import (
     AdmissionController,
     NoisePrototypeFilter,
     batch_dedup,
@@ -31,23 +31,23 @@ from hermes_memory_lancedb import (
     extract_smart_metadata,
     stringify_smart_metadata,
 )
-from hermes_memory_lancedb.admission import AdmissionDecision, AdmissionStats
-from hermes_memory_lancedb.chunker import (
+from athena_memory.admission import AdmissionDecision, AdmissionStats
+from athena_memory.chunker import (
     DEFAULT_CHUNKER_CONFIG,
     ChunkerConfig,
     chunk_document,
     smart_chunk,
 )
-from hermes_memory_lancedb.dedup import (
+from athena_memory.dedup import (
     cosine_batch_dedup,
     DEFAULT_BATCH_THRESHOLD,
     VALID_DECISIONS,
 )
-from hermes_memory_lancedb.noise_proto import (
+from athena_memory.noise_proto import (
     BUILTIN_NOISE_TEXTS,
     DEFAULT_THRESHOLD,
 )
-from hermes_memory_lancedb.smart_metadata import (
+from athena_memory.smart_metadata import (
     derive_fact_key,
     is_memory_active_at,
     is_memory_expired,
@@ -562,7 +562,7 @@ class TestNoisePrototypeFilter(unittest.TestCase):
 class TestSchemaP2Columns(unittest.TestCase):
 
     def test_schema_has_metadata_and_parent_id(self):
-        from hermes_memory_lancedb import _get_schema
+        from athena_memory import _get_schema
         col_names = {f.name for f in _get_schema()}
         self.assertIn("metadata", col_names)
         self.assertIn("parent_id", col_names)
@@ -601,7 +601,7 @@ class TestProviderWiringP2(unittest.TestCase):
 
     def _bare_provider(self, tmpdir: str):
         """Build a provider with admission/noise wired but no real LanceDB table."""
-        from hermes_memory_lancedb import LanceDBMemoryProvider
+        from athena_memory import LanceDBMemoryProvider
         p = LanceDBMemoryProvider()
         p._storage_path = tmpdir
         p._admission = AdmissionController(tmpdir, enabled=True)

@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "hermes-memory-lancedb"
-version = "2.0.0"
-description = "LanceDB vector memory plugin for Hermes agents — management CLI, observability, markdown import, A/B reembed, file locking, reflection subsystem, multi-scope isolation, multi-provider embeddings, chunker, batch dedup, admission control, smart metadata, noise prototypes, temporal classifier, session compaction, memory compactor, intent + query expansion, cross-encoder rerank, MMR diversity"
+name = "athena-memory"
+version = "3.0.0"
+description = "Pluggable memory plugin for Hermes agents (Athena fork) — LanceDB and Postgres+pgvector+pg_search backends; multi-provider embeddings, cross-encoder rerank, MMR diversity, multi-scope isolation, LLM smart extraction, reflection subsystem, management CLI, per-query observability"
 requires-python = ">=3.10"
 dependencies = [
     "openai>=1.0.0",
@@ -26,10 +26,13 @@ pgvector = [
 dev = ["pytest", "pytest-asyncio"]
 
 [project.scripts]
-hermes-memory-lancedb = "hermes_memory_lancedb.cli:main"
+athena-memory = "athena_memory.cli:main"
+# Backwards-compat: the old console script name keeps working for one major version.
+hermes-memory-lancedb = "athena_memory.cli:main"
 
 [project.urls]
-Repository = "https://github.com/TheophilusChinomona/hermes-memory-lancedb"
+Repository = "https://gitlab.com/chinomonatinotenda19/athena-memory"
+Mirror = "https://github.com/TheophilusChinomona/athena-memory"
 
 [tool.hatch.build.targets.wheel]
-packages = ["hermes_memory_lancedb"]
+packages = ["athena_memory", "hermes_memory_lancedb"]

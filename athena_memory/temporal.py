@@ -7,7 +7,7 @@ Ports ``temporal-classifier.ts``. A memory is:
   (today's plan, this week's deploy, "right now", ...)
 
 Dynamic memories decay 3x faster than static ones — see
-``DecayConfig.dynamic_decay_multiplier`` in :mod:`hermes_memory_lancedb.lifecycle`.
+``DecayConfig.dynamic_decay_multiplier`` in :mod:`athena_memory.lifecycle`.
 
 Classification strategy:
   1. Fast rule-based pre-pass (regex + CJK keywords). Cheap, deterministic.

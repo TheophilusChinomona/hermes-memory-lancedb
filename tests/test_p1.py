@@ -14,7 +14,7 @@ import unittest
 from typing import List
 from unittest.mock import MagicMock, patch
 
-from hermes_memory_lancedb import (
+from athena_memory import (
     EMBEDDING_DIMENSIONS,
     GLOBAL_SCOPE,
     PROVIDER_DEFAULT_MODEL,
@@ -29,13 +29,13 @@ from hermes_memory_lancedb import (
     make_embedder,
     parse_agent_id_from_session_key,
 )
-from hermes_memory_lancedb.embedders import (
+from athena_memory.embedders import (
     GeminiEmbedder,
     JinaEmbedder,
     OllamaEmbedder,
     OpenAIEmbedder,
 )
-from hermes_memory_lancedb.scopes import (
+from athena_memory.scopes import (
     ScopeConfig,
     ScopeDefinition,
     agent_scope,
@@ -405,7 +405,7 @@ class TestEmbedderFactory(unittest.TestCase):
         self.assertEqual(emb.dimensions, 1024)
 
     def test_openrouter_sends_dimensions_for_v3_family(self):
-        from hermes_memory_lancedb.embedders import _is_openai_v3_family
+        from athena_memory.embedders import _is_openai_v3_family
         # Both prefixed and bare model ids should be recognised.
         self.assertTrue(_is_openai_v3_family("text-embedding-3-small"))
         self.assertTrue(_is_openai_v3_family("openai/text-embedding-3-large"))
@@ -414,7 +414,7 @@ class TestEmbedderFactory(unittest.TestCase):
         self.assertFalse(_is_openai_v3_family("voyage/voyage-3"))
 
     def test_openrouter_is_provider_available(self):
-        from hermes_memory_lancedb.embedders import is_provider_available
+        from athena_memory.embedders import is_provider_available
         env = {k: v for k, v in os.environ.items() if "API_KEY" not in k}
         with patch.dict(os.environ, env, clear=True):
             self.assertFalse(is_provider_available("openrouter"))
@@ -588,7 +588,7 @@ class TestSchemaFields(unittest.TestCase):
             self.assertIn(col, SCOPE_COLUMN_DEFAULTS)
 
     def test_get_schema_includes_scope_columns(self):
-        from hermes_memory_lancedb import _get_schema
+        from athena_memory import _get_schema
 
         schema = _get_schema(embed_dim=128)
         names = {f.name for f in schema}
@@ -600,7 +600,7 @@ class TestSchemaFields(unittest.TestCase):
         self.assertEqual(vec_field.type.list_size, 128)
 
     def test_get_schema_default_dim(self):
-        from hermes_memory_lancedb import _get_schema
+        from athena_memory import _get_schema
 
         schema = _get_schema()
         vec_field = next(f for f in schema if f.name == "vector")
@@ -638,7 +638,7 @@ class TestSchemaMigrationAddsScopeColumns(unittest.TestCase):
         # v2.0.0: provider now routes schema work through self._store. Wrap
         # the fake table in a LanceDBStore adapter so the existing fake-table
         # contract (.schema, .add_columns) drives the migration as before.
-        from hermes_memory_lancedb.backends import make_lancedb_store
+        from athena_memory.backends import make_lancedb_store
         provider._store = make_lancedb_store(
             db=None, table=fake_table, storage_path="", table_name="memories",
         )
@@ -727,7 +727,7 @@ class TestProviderScopeWiring(unittest.TestCase):
             "LANCEDB_PATH": "/tmp/__hermes_p1_no_table__",
         }
         with patch.dict(os.environ, env, clear=False):
-            with patch("hermes_memory_lancedb.make_embedder") as m_emb:
+            with patch("athena_memory.make_embedder") as m_emb:
                 fake_emb = MagicMock()
                 fake_emb.dimensions = 1536
                 fake_emb.embed = lambda t: [0.0] * 1536
@@ -763,7 +763,7 @@ class TestProviderScopeWiring(unittest.TestCase):
         for k in ("LANCEDB_AGENT_ID", "LANCEDB_PROJECT_ID", "LANCEDB_TEAM_ID", "LANCEDB_WORKSPACE_ID"):
             env[k] = ""
         with patch.dict(os.environ, env, clear=False):
-            with patch("hermes_memory_lancedb.make_embedder") as m_emb:
+            with patch("athena_memory.make_embedder") as m_emb:
                 fake_emb = MagicMock()
                 fake_emb.dimensions = 1536
                 fake_emb.embed = lambda t: [0.0] * 1536
@@ -820,7 +820,7 @@ class TestEmbeddingDimensions(unittest.TestCase):
     def test_provider_default_models_have_known_dims(self):
         # OpenRouter defaults use provider-prefixed model ids (e.g.
         # "openai/text-embedding-3-small"); allow lookup via prefix-strip.
-        from hermes_memory_lancedb.embedders import _strip_provider_prefix
+        from athena_memory.embedders import _strip_provider_prefix
         for provider, model in PROVIDER_DEFAULT_MODEL.items():
             stripped = _strip_provider_prefix(model)
             self.assertTrue(
