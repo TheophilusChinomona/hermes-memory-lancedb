@@ -19,7 +19,7 @@ Python port of [memory-lancedb-pro](https://github.com/TheophilusChinomona/memor
 
 ```bash
 # 1. Install with the pgvector extra
-pip install "athena-memory[pgvector] @ git+https://github.com/TheophilusChinomona/athena-memory@main"
+pip install "athena-memory[pgvector] @ git+https://gitlab.com/chinomonatinotenda19/athena-memory@main"
 
 # 2. Point at any Postgres with `vector` (and optionally `pg_search`) installed.
 #    The plugin creates its own `hermes_memory` schema on first connect.
@@ -44,7 +44,7 @@ print(p.handle_tool_call("lancedb_search", {"query": "who is Theo?", "top_k": 3}
 ### B. LanceDB (embedded, AVX2-capable hardware)
 
 ```bash
-pip install "athena-memory[lancedb] @ git+https://github.com/TheophilusChinomona/athena-memory@main"
+pip install "athena-memory[lancedb] @ git+https://gitlab.com/chinomonatinotenda19/athena-memory@main"
 export OPENAI_API_KEY=sk-...
 # That's it — LANCEDB_PATH defaults to $HERMES_HOME/lancedb.
 ```

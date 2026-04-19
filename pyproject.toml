@@ -31,7 +31,8 @@ athena-memory = "athena_memory.cli:main"
 hermes-memory-lancedb = "athena_memory.cli:main"
 
 [project.urls]
-Repository = "https://github.com/TheophilusChinomona/athena-memory"
+Repository = "https://gitlab.com/chinomonatinotenda19/athena-memory"
+Mirror = "https://github.com/TheophilusChinomona/athena-memory"
 
 [tool.hatch.build.targets.wheel]
 packages = ["athena_memory", "hermes_memory_lancedb"]
