@@ -4,16 +4,20 @@ Ported from memory-lancedb-pro TypeScript src/embedder.ts.
 
 Supported providers (selected via ``LANCEDB_EMBED_PROVIDER`` env var):
 
-  - ``openai``   — OpenAI text-embedding-3-* (default)
-  - ``jina``     — Jina embeddings v3/v5 family
-  - ``gemini``   — Google Generative AI embeddings (REST)
-  - ``ollama``   — Local Ollama server (``/api/embeddings``)
+  - ``openai``        — OpenAI text-embedding-3-* (default)
+  - ``openrouter``    — OpenRouter routed embeddings (default model
+    ``openai/text-embedding-3-small``); pass ``openai/...`` /
+    ``cohere/...`` / ``voyage/...`` / ``jina/...`` model ids
+  - ``jina``          — Jina embeddings v3/v5 family
+  - ``gemini``        — Google Generative AI embeddings (REST)
+  - ``ollama``        — Local Ollama server (``/api/embeddings``)
   - ``openai-compatible`` — Any OpenAI-shaped endpoint via custom
     ``LANCEDB_EMBED_BASE_URL``.
 
 Each provider has its own API key env var:
 
   - ``OPENAI_API_KEY``
+  - ``OPENROUTER_API_KEY``
   - ``JINA_API_KEY``
   - ``GEMINI_API_KEY``
   - ``OLLAMA_BASE_URL`` (URL, not a key — defaults to
@@ -72,11 +76,28 @@ EMBEDDING_DIMENSIONS: Dict[str, int] = {
 # Provider defaults
 PROVIDER_DEFAULT_MODEL: Dict[str, str] = {
     "openai": "text-embedding-3-small",
+    "openrouter": "openai/text-embedding-3-small",
     "jina": "jina-embeddings-v3",
     "gemini": "text-embedding-004",
     "ollama": "nomic-embed-text",
     "openai-compatible": "text-embedding-3-small",
 }
+
+# OpenRouter routes via provider-prefixed model ids (e.g. "openai/text-embedding-3-small").
+# Strip these so EMBEDDING_DIMENSIONS lookups still hit.
+_PROVIDER_PREFIXES = ("openai/", "cohere/", "voyage/", "jina/", "google/", "mistralai/")
+
+
+def _strip_provider_prefix(model: str) -> str:
+    for p in _PROVIDER_PREFIXES:
+        if model.startswith(p):
+            return model[len(p):]
+    return model
+
+
+def _is_openai_v3_family(model: str) -> bool:
+    """True for OpenAI text-embedding-3-* models, with or without provider prefix."""
+    return _strip_provider_prefix(model).startswith("text-embedding-3")
 
 # When dimensions can't be inferred from model id, fall back to this.
 _DEFAULT_DIM_FALLBACK = 1536
@@ -163,7 +184,7 @@ class OpenAIEmbedder(Embedder):
     ):
         if not api_key:
             raise EmbeddingError("OpenAI embedder requires api_key")
-        dim = dimensions or EMBEDDING_DIMENSIONS.get(model, _DEFAULT_DIM_FALLBACK)
+        dim = dimensions or EMBEDDING_DIMENSIONS.get(_strip_provider_prefix(model), _DEFAULT_DIM_FALLBACK)
         super().__init__(model, dim)
         self._api_key = api_key
         self._base_url = base_url
@@ -179,7 +200,7 @@ class OpenAIEmbedder(Embedder):
             client = OpenAI(api_key=self._api_key)
             kwargs = {"model": self._model, "input": text}
             # Only request dimensions for models that support it (3-* family).
-            if self._model.startswith("text-embedding-3") and self._dimensions in (256, 512, 1024, 1536, 3072):
+            if _is_openai_v3_family(self._model) and self._dimensions in (256, 512, 1024, 1536, 3072):
                 kwargs["dimensions"] = self._dimensions
             resp = client.embeddings.create(**kwargs)
             return list(resp.data[0].embedding)
@@ -193,7 +214,7 @@ class OpenAIEmbedder(Embedder):
 
         url = (self._base_url or "https://api.openai.com/v1").rstrip("/") + "/embeddings"
         payload = {"model": self._model, "input": text}
-        if self._model.startswith("text-embedding-3"):
+        if _is_openai_v3_family(self._model):
             payload["dimensions"] = self._dimensions
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -373,11 +394,14 @@ def _resolve_dimensions(provider: str, model: str, override: Optional[int]) -> i
     if override and override > 0:
         return int(override)
     dim = EMBEDDING_DIMENSIONS.get(model)
+    if dim is None:
+        dim = EMBEDDING_DIMENSIONS.get(_strip_provider_prefix(model))
     if dim is not None:
         return dim
     # Provider-typical fallback
     fallback = {
         "openai": 1536,
+        "openrouter": 1536,
         "openai-compatible": 1536,
         "jina": 1024,
         "gemini": 768,
@@ -437,6 +461,13 @@ def make_embedder(
         key = api_key or os.environ.get("LANCEDB_EMBED_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
         return OpenAIEmbedder(key, model, dimensions=dim, base_url=base_url)
 
+    if provider == "openrouter":
+        key = api_key or os.environ.get("LANCEDB_EMBED_API_KEY") or os.environ.get("OPENROUTER_API_KEY") or ""
+        # Always go through the openai-compatible httpx path. Default base
+        # is OpenRouter's API; allow override for self-hosted proxies.
+        or_base = base_url or "https://openrouter.ai/api/v1"
+        return OpenAIEmbedder(key, model, dimensions=dim, base_url=or_base)
+
     if provider == "openai-compatible":
         key = api_key or os.environ.get("LANCEDB_EMBED_API_KEY") or os.environ.get("OPENAI_API_KEY") or "sk-noop"
         if not base_url:
@@ -471,6 +502,8 @@ def is_provider_available(provider: str) -> bool:
     provider = provider.lower().strip()
     if provider in ("openai", "openai-compatible"):
         return bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("LANCEDB_EMBED_API_KEY"))
+    if provider == "openrouter":
+        return bool(os.environ.get("OPENROUTER_API_KEY") or os.environ.get("LANCEDB_EMBED_API_KEY"))
     if provider == "jina":
         return bool(os.environ.get("JINA_API_KEY") or os.environ.get("LANCEDB_EMBED_API_KEY"))
     if provider == "gemini":

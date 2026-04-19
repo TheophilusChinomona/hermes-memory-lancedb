@@ -127,6 +127,12 @@ from .embedders import (
     is_provider_available,
     make_embedder,
 )
+from .backends import (
+    detect_backend,
+    make_lancedb_store,
+    make_pgvector_store,
+)
+from .backends.base import MemoryStore, StoreUnavailable
 from .scopes import (
     GLOBAL_SCOPE,
     SCOPE_COLUMN_DEFAULTS,
@@ -924,6 +930,10 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
     def __init__(self):
         self._db = None
         self._table = None
+        # v2.0.0: pluggable persistence backend (LanceDB or pgvector).
+        # Populated during initialize(); stays None if init fails.
+        self._store: Optional[MemoryStore] = None
+        self._backend_name: str = "lancedb"
         self._embedder: Optional[Embedder] = None
         self._llm: Optional[_LLMClient] = None
         self._user_id = "andrew"
@@ -1053,24 +1063,56 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return
 
         try:
-            import lancedb
-
-            os.makedirs(self._storage_path, exist_ok=True)
-            self._db = lancedb.connect(self._storage_path)
-
-            if _TABLE_NAME in self._db.table_names():
-                self._table = self._db.open_table(_TABLE_NAME)
+            # v2.0.0: branch on backend BEFORE importing lancedb. The lancedb
+            # native lib SIGILLs on hosts without AVX2; in pgvector mode we
+            # must NEVER touch it.
+            self._backend_name = detect_backend()
+            if self._backend_name == "pgvector":
+                try:
+                    self._store = make_pgvector_store(embedding_dim=self._embed_dim)
+                    self._store.initialize()
+                except StoreUnavailable as e:
+                    logger.warning(
+                        "pgvector backend unavailable (%s) — provider stays unready", e
+                    )
+                    self._store = None
+                    self._ready = False
+                    return
+                # Pgvector is responsible for its own table creation. Run the
+                # schema-migration path so any new columns added in later
+                # versions land on existing databases. The pg backend reuses
+                # the same default-SQL fragments the LanceDB path produces.
                 self._migrate_schema_if_needed()
+                self._store.ensure_fts_index()
+                # `self._table` stays None for the pgvector path — code paths
+                # that still reference it must go through `self._store`.
+                self._table = None
             else:
-                self._table = self._db.create_table(
-                    _TABLE_NAME, schema=_get_schema(self._embed_dim)
-                )
-                self._has_scope_columns = True
+                import lancedb
 
-            try:
-                self._table.create_fts_index("content", replace=True)
-            except Exception as e:
-                logger.debug("FTS index skipped: %s", e)
+                os.makedirs(self._storage_path, exist_ok=True)
+                self._db = lancedb.connect(self._storage_path)
+
+                if _TABLE_NAME in self._db.table_names():
+                    self._table = self._db.open_table(_TABLE_NAME)
+                else:
+                    self._table = self._db.create_table(
+                        _TABLE_NAME, schema=_get_schema(self._embed_dim)
+                    )
+                    self._has_scope_columns = True
+
+                # Wrap the freshly-opened table so the rest of the provider
+                # can route everything through the same MemoryStore surface.
+                self._store = make_lancedb_store(
+                    db=self._db,
+                    table=self._table,
+                    storage_path=self._storage_path,
+                    table_name=_TABLE_NAME,
+                )
+                # Run schema migration via the store (LanceDB-only path; pg
+                # already migrated above).
+                self._migrate_schema_if_needed()
+                self._store.ensure_fts_index()
 
             # LLM client still uses OpenAI for extraction/dedup.
             llm_key = os.environ.get("OPENAI_API_KEY", "")
@@ -1110,8 +1152,23 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             # P3: lazy-init the reflection store. Default off — set
             # LANCEDB_REFLECTION_ENABLED=1 to opt in. Embedder is optional;
             # if absent, the reflection store falls back to FTS-only.
-            if os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1":
+            #
+            # Skipped on the pgvector backend: ReflectionStore embeds its
+            # own LanceDB connection, which SIGILLs on hosts without AVX2.
+            # A PgvectorReflectionStore is a follow-up.
+            if (
+                os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1"
+                and self._backend_name != "pgvector"
+            ):
                 self._init_reflection_store()
+            elif (
+                os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1"
+                and self._backend_name == "pgvector"
+            ):
+                logger.info(
+                    "LANCEDB_REFLECTION_ENABLED=1 ignored on pgvector backend "
+                    "(ReflectionStore is LanceDB-only; pgvector port pending)"
+                )
 
             # P4: auto-capture cleanup for the previous session's noise + session
             # recovery for re-opened sessions. Both run in the background to keep
@@ -1285,10 +1342,10 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             logger.debug("Session recovery failed: %s", e)
 
     def _migrate_schema_if_needed(self) -> None:
-        if self._table is None:
+        if self._store is None:
             return
         try:
-            existing_cols = {f.name for f in self._table.schema}
+            existing_cols = self._store.existing_columns()
             # v1.1.0 fields
             v110_fields = {
                 "tier": "'peripheral'",
@@ -1308,27 +1365,27 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             new_fields = {**v110_fields, **scope_fields}
             missing = {k: v for k, v in new_fields.items() if k not in existing_cols}
             if missing:
-                # P5: wrap migration in the table lock so two Hermes processes
+                # P5: wrap migration in the store lock so two Hermes processes
                 # can't try to add the same columns simultaneously.
-                table_path = os.path.join(self._storage_path, _TABLE_NAME)
-                with _with_lock(table_path):
+                table_path = os.path.join(self._storage_path or "", _TABLE_NAME)
+                with self._store.with_lock(table_path):
                     # Re-check after acquiring the lock — another process may
                     # have already migrated.
-                    existing_cols = {f.name for f in self._table.schema}
+                    existing_cols = self._store.existing_columns()
                     missing = {k: v for k, v in new_fields.items() if k not in existing_cols}
                     if missing:
-                        self._table.add_columns(missing)
-                        logger.info("LanceDB schema migrated: added columns %s", list(missing.keys()))
+                        self._store.add_columns(missing)
+                        logger.info("Memory schema migrated: added columns %s", list(missing.keys()))
             # P1: determine whether scope columns are now present (either pre-existing
             # or just-added). Used to choose between legacy `user_id`-only
             # filtering and the composable scope filter.
-            updated_cols = {f.name for f in self._table.schema}
+            updated_cols = self._store.existing_columns()
             self._has_scope_columns = all(c in updated_cols for c in SCOPE_COLUMNS)
         except Exception as e:
-            logger.warning("LanceDB schema migration failed (reads will use defaults): %s", e)
+            logger.warning("Memory schema migration failed (reads will use defaults): %s", e)
             # Be conservative — without confirmed migration, assume legacy schema.
             try:
-                cols = {f.name for f in self._table.schema}
+                cols = self._store.existing_columns()
                 self._has_scope_columns = all(c in cols for c in SCOPE_COLUMNS)
             except Exception:
                 self._has_scope_columns = False
@@ -1413,17 +1470,16 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         *,
         trace: Optional["RetrievalTrace"] = None,
     ) -> List[Dict]:
-        if not self._ready or self._table is None or self._embedder is None:
+        if not self._ready or self._store is None or self._embedder is None:
             return []
         try:
             vec = self._embedder.embed(query)
             where_clause = self._build_scope_where()
             if trace is not None:
                 trace.start_stage("vector_search", input_ids=[])
-            v_search = self._table.search(vec, vector_column_name="vector")
-            if where_clause:
-                v_search = v_search.where(where_clause, prefilter=True)
-            v_results = v_search.limit(_TOP_K_VECTOR).to_list()
+            v_results = self._store.vector_search(
+                vec, where=where_clause or None, limit=_TOP_K_VECTOR
+            )
             if trace is not None:
                 trace.end_stage([str(r.get("id", "")) for r in v_results])
                 trace.start_stage("bm25", input_ids=[])
@@ -1443,10 +1499,9 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             try:
                 for q in expanded_queries[:3]:  # cap to avoid latency blow-up
                     try:
-                        b_search = self._table.search(q, query_type="fts")
-                        if where_clause:
-                            b_search = b_search.where(where_clause, prefilter=True)
-                        rows = b_search.limit(_TOP_K_BM25).to_list()
+                        rows = self._store.fts_search(
+                            q, where=where_clause or None, limit=_TOP_K_BM25
+                        )
                     except Exception:
                         continue
                     for r in rows:
@@ -1646,43 +1701,40 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
 
     def _bump_access(self, ids: List[str]) -> None:
         """Increment access_count and re-evaluate tier for accessed memories."""
-        if not self._ready or self._table is None:
+        if not self._ready or self._store is None:
             return
         try:
             for mid in ids:
-                rows = self._table.search().where(f"id = '{mid}'", prefilter=True).limit(1).to_list()
-                if not rows:
+                row = self._store.get_by_id(mid)
+                if not row:
                     continue
-                row = rows[0]
                 new_count = int(row.get("access_count") or 0) + 1
                 tier = row.get("tier") or "peripheral"
                 ts = row.get("timestamp", 0.0) or 0.0
                 importance = float(row.get("importance") or 0.5)
                 decay = _weibull_weight(_age_days(ts))
                 new_tier = _tier_evaluate(tier, new_count, importance, decay, _age_days(ts)) or tier
-                self._table.update(
-                    where=f"id = '{mid}'",
-                    values={"access_count": new_count, "tier": new_tier},
+                self._store.update_row(
+                    mid,
+                    {"access_count": new_count, "tier": new_tier},
                 )
         except Exception as e:
             logger.debug("LanceDB access bump failed: %s", e)
 
     def _find_similar(self, text: str, threshold: float = _DEDUP_SIMILARITY_THRESHOLD) -> Optional[Dict]:
         """Find a highly similar existing memory using vector search."""
-        if not self._ready or self._table is None or self._embedder is None:
+        if not self._ready or self._store is None or self._embedder is None:
             return None
         try:
             vec = self._embedder.embed(text)
             where_clause = self._build_scope_where()
-            search = self._table.search(vec, vector_column_name="vector")
-            if where_clause:
-                search = search.where(where_clause, prefilter=True)
-            results = search.limit(1).to_list()
-            if results and results[0].get("_distance", 999) < threshold:
-                return results[0]
+            return self._store.vector_distance_probe(
+                vec,
+                where=where_clause or None,
+                threshold=threshold,
+            )
         except Exception:
-            pass
-        return None
+            return None
 
     def _is_vector_noise(self, vec: List[float]) -> bool:
         """Vector-level noise check via the prototype bank (P2)."""
@@ -1709,7 +1761,7 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         return True, ""
 
     def _write_entries(self, entries: List[Dict]) -> None:
-        if not self._ready or not entries or self._table is None or self._embedder is None:
+        if not self._ready or not entries or self._store is None or self._embedder is None:
             return
         try:
             rows = []
@@ -1817,10 +1869,12 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     rows.append(row)
             if rows:
                 # P5: cross-process file lock so multiple Hermes instances don't
-                # corrupt the table when writing concurrently.
+                # corrupt the table when writing concurrently. The store
+                # adapter routes this through portalocker (LanceDB) or a
+                # Postgres advisory lock (pgvector).
                 table_path = os.path.join(self._storage_path or "", _TABLE_NAME)
-                with _with_lock(table_path):
-                    self._table.add(rows)
+                with self._store.with_lock(table_path):
+                    self._store.add_rows(rows)
                 # P4: nudge the compactor — it has its own counter + cooldown.
                 try:
                     for _ in rows:
@@ -1902,7 +1956,8 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
 
             if decision == "supersede" and similar and similar.get("id"):
                 try:
-                    self._table.delete(f"id = '{similar['id']}'")
+                    if self._store is not None:
+                        self._store.delete_by_id(str(similar["id"]))
                 except Exception:
                     pass
                 self._write_entries([{**candidate, "source": "extraction", "timestamp": time.time(),
@@ -1912,7 +1967,8 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             if decision == "merge" and merged and similar:
                 if similar.get("id"):
                     try:
-                        self._table.delete(f"id = '{similar['id']}'")
+                        if self._store is not None:
+                            self._store.delete_by_id(str(similar["id"]))
                     except Exception:
                         pass
                 candidate["content"] = merged
@@ -2185,13 +2241,13 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return json.dumps({"stored": True, "content": content[:100]})
 
         if tool_name == "lancedb_forget":
-            if not self._ready or self._table is None:
+            if not self._ready or self._store is None:
                 return json.dumps({"error": "memory not ready"})
             mem_id = args.get("id", "")
             query = args.get("query", "")
             if mem_id:
                 try:
-                    self._table.delete(f"id = '{mem_id}'")
+                    self._store.delete_by_id(str(mem_id))
                     return json.dumps({"deleted": True, "id": mem_id})
                 except Exception as e:
                     return json.dumps({"error": str(e)})
@@ -2200,14 +2256,14 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 if hits:
                     mid = hits[0]["id"]
                     try:
-                        self._table.delete(f"id = '{mid}'")
+                        self._store.delete_by_id(str(mid))
                         return json.dumps({"deleted": True, "content": hits[0]["content"][:100]})
                     except Exception as e:
                         return json.dumps({"error": str(e)})
             return json.dumps({"error": "provide query or id"})
 
         if tool_name == "lancedb_compact":
-            if not self._ready or self._table is None:
+            if not self._ready or self._store is None:
                 return json.dumps({"error": "memory not ready"})
             cfg = _compactor.CompactionConfig(
                 min_age_days=float(args.get("min_age_days", 7.0)),
@@ -2230,14 +2286,13 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 return json.dumps({"error": str(e)})
 
         if tool_name == "lancedb_stats":
-            if not self._ready or self._table is None:
+            if not self._ready or self._store is None:
                 return json.dumps({"error": "memory not ready"})
             try:
                 where_clause = self._build_scope_where()
-                search = self._table.search()
-                if where_clause:
-                    search = search.where(where_clause, prefilter=True)
-                rows = search.limit(10000).to_list()
+                rows = self._store.list_rows(
+                    where=where_clause or None, limit=10000
+                )
                 total = len(rows)
                 tiers: Dict[str, int] = {}
                 cats: Dict[str, int] = {}
