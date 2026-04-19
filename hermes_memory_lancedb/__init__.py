@@ -1,6 +1,13 @@
-"""hermes-memory-lancedb v1.1.0 — LanceDB vector memory plugin for Hermes agents.
+"""hermes-memory-lancedb v1.2.0 — LanceDB vector memory plugin for Hermes agents.
 
 Hybrid BM25 + vector recall, Weibull decay, OpenAI text-embedding-3-small.
+
+v1.2.0 additions (P0 of memory-lancedb-pro port — retrieval quality):
+  - Cross-encoder reranking via Jina (fallback: cosine of query vs doc vectors)
+  - MMR diversity: defer near-duplicate hits (cosine > 0.85) to end
+  - Length normalization: log2 penalty for entries longer than 500 chars
+  - Hard min-score cutoff after pipeline (default 0.35)
+  - Decay weight applied as score multiplier (was filter-only before)
 
 v1.1.0 additions (ported from memory-lancedb-pro TypeScript fork):
   - LLM Smart Extraction: 6-category system (profile, preferences, entities,
@@ -83,6 +90,19 @@ _RRF_K = 60
 _WEIBULL_SCALE = 30.0
 _WEIBULL_SHAPE = 0.7
 _DECAY_THRESHOLD = 0.05
+
+# v1.2.0 retrieval pipeline tuning
+_LENGTH_NORM_ANCHOR = 500
+_LENGTH_NORM_FLOOR = 0.3
+_MMR_SIMILARITY_THRESHOLD = 0.85
+_MIN_SCORE_EARLY = 0.3
+_HARD_MIN_SCORE = 0.35
+_RERANK_MODEL = "jina-reranker-v3"
+_RERANK_ENDPOINT = "https://api.jina.ai/v1/rerank"
+_RERANK_TIMEOUT_S = 5.0
+_RERANK_BLEND_RERANK = 0.6
+_RERANK_BLEND_ORIGINAL = 0.4
+_RERANK_UNRETURNED_PENALTY = 0.8
 
 _MAX_MEMORIES_PER_EXTRACTION = 5
 _DEDUP_SIMILARITY_THRESHOLD = 0.50  # L2 distance; text-embedding-3-small vectors are normalised
@@ -333,7 +353,214 @@ def _merge_rrf(vector_hits: List[Dict], bm25_hits: List[Dict], top_k: int) -> Li
         scores[mid] = scores.get(mid, 0.0) + _rrf_score(rank)
         by_id.setdefault(mid, hit)
     ranked = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
-    return [by_id[mid] for mid in ranked[:top_k]]
+    out = []
+    for mid in ranked[:top_k]:
+        h = dict(by_id[mid])
+        h["score"] = scores[mid]
+        out.append(h)
+    return out
+
+
+def _clamp01(value: float, fallback: float = 0.0) -> float:
+    if value != value or value in (float("inf"), float("-inf")):  # NaN / inf
+        return max(0.0, min(1.0, fallback))
+    return max(0.0, min(1.0, value))
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    if len(a) != len(b) or not a:
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+
+def _normalize_to_top(hits: List[Dict]) -> List[Dict]:
+    """Rescale `score` so the top hit is 1.0 (no-op if max <= 0 or empty)."""
+    if not hits:
+        return hits
+    top = max(h.get("score", 0.0) for h in hits)
+    if top <= 0:
+        return hits
+    for h in hits:
+        h["score"] = h.get("score", 0.0) / top
+    return hits
+
+
+def _apply_length_normalization(
+    hits: List[Dict],
+    anchor: int = _LENGTH_NORM_ANCHOR,
+) -> List[Dict]:
+    """Penalize sprawling entries that dominate via keyword density.
+
+    factor = 1 / (1 + 0.5 * log2(max(charLen/anchor, 1)))
+    Entries at or below `anchor` chars: no penalty. Floor: score * 0.3.
+    """
+    if anchor <= 0 or not hits:
+        return hits
+    out = []
+    for h in hits:
+        text = h.get("content") or h.get("abstract") or ""
+        ratio = len(text) / anchor if anchor > 0 else 1.0
+        log_ratio = math.log2(max(ratio, 1.0))
+        factor = 1.0 / (1.0 + 0.5 * log_ratio)
+        original = h.get("score", 0.0)
+        new_h = dict(h)
+        new_h["score"] = _clamp01(original * factor, original * _LENGTH_NORM_FLOOR)
+        out.append(new_h)
+    out.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return out
+
+
+def _apply_mmr_diversity(
+    hits: List[Dict],
+    threshold: float = _MMR_SIMILARITY_THRESHOLD,
+) -> List[Dict]:
+    """Greedy MMR — defer near-duplicates (cosine > threshold) to end.
+
+    Operates on hits' `vector` field. Hits without vectors are always kept
+    in the selected list (no similarity check possible).
+    """
+    if len(hits) <= 1:
+        return hits
+    selected: List[Dict] = []
+    deferred: List[Dict] = []
+    for cand in hits:
+        c_vec = cand.get("vector")
+        too_similar = False
+        if c_vec is not None and len(c_vec) > 0:
+            c_list = list(c_vec)
+            for sel in selected:
+                s_vec = sel.get("vector")
+                if s_vec is None or len(s_vec) == 0:
+                    continue
+                if _cosine_similarity(c_list, list(s_vec)) > threshold:
+                    too_similar = True
+                    break
+        if too_similar:
+            deferred.append(cand)
+        else:
+            selected.append(cand)
+    return selected + deferred
+
+
+def _rerank_jina(
+    query: str,
+    hits: List[Dict],
+    api_key: str,
+    model: str = _RERANK_MODEL,
+    endpoint: str = _RERANK_ENDPOINT,
+    timeout_s: float = _RERANK_TIMEOUT_S,
+) -> Optional[List[Dict]]:
+    """Cross-encoder rerank via Jina's API.
+
+    Returns None on any failure so callers can fall back to cosine rerank.
+    Blends 60% cross-encoder score + 40% original fused score, clamped to
+    [score*0.5, 1.0]. Unreturned candidates get score * 0.8 (mild penalty).
+    """
+    if not hits or not api_key:
+        return None
+    try:
+        import httpx
+        documents = [h.get("content", "") for h in hits]
+        body = {
+            "model": model,
+            "query": query,
+            "documents": documents,
+            "top_n": len(hits),
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        resp = httpx.post(endpoint, json=body, headers=headers, timeout=timeout_s)
+        if resp.status_code >= 400:
+            logger.debug("Jina rerank HTTP %s: %s", resp.status_code, resp.text[:200])
+            return None
+        data = resp.json()
+        results = data.get("results") if isinstance(data, dict) else None
+        if not results:
+            return None
+
+        returned: Dict[int, float] = {}
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            cross = item.get("relevance_score")
+            if cross is None:
+                cross = item.get("score")
+            if idx is None or cross is None:
+                continue
+            if not isinstance(idx, int) or not 0 <= idx < len(hits):
+                continue
+            returned[idx] = float(cross)
+
+        if not returned:
+            return None
+
+        out: List[Dict] = []
+        for idx, cross in returned.items():
+            original = dict(hits[idx])
+            blended = (
+                cross * _RERANK_BLEND_RERANK
+                + original.get("score", 0.0) * _RERANK_BLEND_ORIGINAL
+            )
+            original["score"] = _clamp01(blended, original.get("score", 0.0) * 0.5)
+            original["reranked_score"] = float(cross)
+            out.append(original)
+        for idx, h in enumerate(hits):
+            if idx in returned:
+                continue
+            unreturned = dict(h)
+            unreturned["score"] = _clamp01(
+                h.get("score", 0.0) * _RERANK_UNRETURNED_PENALTY,
+                h.get("score", 0.0) * 0.5,
+            )
+            out.append(unreturned)
+        out.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return out
+    except Exception as e:
+        logger.debug("Jina rerank failed: %s", e)
+        return None
+
+
+def _rerank_cosine_fallback(
+    query_vec: List[float],
+    hits: List[Dict],
+) -> List[Dict]:
+    """Lightweight cosine rerank when no API key is configured.
+
+    Blends 70% original fused score + 30% cosine(query, doc). Hits without
+    a `vector` field pass through with their existing score unchanged.
+    """
+    if not hits or not query_vec:
+        return hits
+    try:
+        out = []
+        for h in hits:
+            vec = h.get("vector")
+            if vec is None or len(vec) == 0:
+                out.append(h)
+                continue
+            cos = _cosine_similarity(query_vec, list(vec))
+            blended = h.get("score", 0.0) * 0.7 + cos * 0.3
+            new_h = dict(h)
+            new_h["score"] = _clamp01(blended, h.get("score", 0.0))
+            new_h["reranked_score"] = float(cos)
+            out.append(new_h)
+        out.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return out
+    except Exception as e:
+        logger.debug("Cosine rerank failed: %s", e)
+        return hits
 
 
 def _msg_text(msg: Dict) -> str:
@@ -638,13 +865,78 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     "category": row.get("category", ""),
                     "access_count": row.get("access_count", 0),
                     "importance": row.get("importance", 0.5),
+                    "vector": row.get("vector"),
                 }
 
-            merged = _merge_rrf(
-                [h for r in v_results if (h := _hit(r))],
-                [h for r in b_results if (h := _hit(r))],
-                top_k=top_k,
+            v_hits = [h for r in v_results if (h := _hit(r))]
+            b_hits = [h for r in b_results if (h := _hit(r))]
+
+            # Stage 1: RRF fusion — fetch a wider window than top_k so the
+            # downstream stages (rerank/length-norm/MMR) have enough to work with.
+            rerank_window = max(top_k * 4, 12)
+            merged = _merge_rrf(v_hits, b_hits, top_k=rerank_window)
+            if not merged:
+                return []
+
+            # Stage 2: Normalize RRF scores to [0, 1] so subsequent thresholds
+            # (min-score, hard-min-score) operate on a meaningful scale.
+            merged = _normalize_to_top(merged)
+
+            # Stage 3: Apply tier/recency decay weight as a multiplicative boost.
+            for h in merged:
+                original = h.get("score", 0.0)
+                h["score"] = _clamp01(
+                    original * h.get("decay_weight", 1.0),
+                    original * 0.3,
+                )
+            merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+
+            # Stage 4: Early min-score filter.
+            merged = [h for h in merged if h.get("score", 0.0) >= _MIN_SCORE_EARLY]
+            if not merged:
+                return []
+
+            # Stage 5: Cross-encoder rerank — Jina if API key configured,
+            # else cosine fallback (free, uses already-fetched vectors).
+            rerank_input = merged[: top_k * 2]
+            tail = merged[top_k * 2 :]
+            rerank_api_key = (
+                os.environ.get("LANCEDB_RERANK_API_KEY")
+                or os.environ.get("JINA_API_KEY", "")
             )
+            rerank_provider = os.environ.get("LANCEDB_RERANK_PROVIDER", "auto").lower()
+            reranked: Optional[List[Dict]] = None
+            if rerank_provider != "none" and rerank_api_key:
+                reranked = _rerank_jina(
+                    query,
+                    rerank_input,
+                    api_key=rerank_api_key,
+                    model=os.environ.get("LANCEDB_RERANK_MODEL", _RERANK_MODEL),
+                    endpoint=os.environ.get("LANCEDB_RERANK_ENDPOINT", _RERANK_ENDPOINT),
+                    timeout_s=float(
+                        os.environ.get("LANCEDB_RERANK_TIMEOUT_S", str(_RERANK_TIMEOUT_S))
+                    ),
+                )
+            if reranked is None and rerank_provider != "none":
+                reranked = _rerank_cosine_fallback(vec, rerank_input)
+            if reranked is not None:
+                merged = sorted(reranked + tail, key=lambda x: x.get("score", 0.0), reverse=True)
+
+            # Stage 6: Length normalization (penalize sprawling entries).
+            merged = _apply_length_normalization(merged)
+
+            # Stage 7: Hard min-score cutoff (drops post-rerank low-confidence hits).
+            try:
+                hard_min = float(os.environ.get("LANCEDB_HARD_MIN_SCORE", str(_HARD_MIN_SCORE)))
+            except (TypeError, ValueError):
+                hard_min = _HARD_MIN_SCORE
+            merged = [h for h in merged if h.get("score", 0.0) >= hard_min]
+
+            # Stage 8: MMR diversity — defer near-duplicates to the tail.
+            merged = _apply_mmr_diversity(merged)
+
+            # Final: take top_k.
+            merged = merged[:top_k]
 
             # Bump access counts async
             if merged:

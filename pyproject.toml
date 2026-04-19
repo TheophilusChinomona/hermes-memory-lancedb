@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-memory-lancedb"
-version = "1.1.0"
-description = "LanceDB vector memory plugin for Hermes agents — LLM Smart Extraction, 3-tier memory, dedup pipeline, hybrid BM25+vector recall"
+version = "1.2.0"
+description = "LanceDB vector memory plugin for Hermes agents — cross-encoder rerank, MMR diversity, length norm, LLM Smart Extraction, 3-tier memory, dedup pipeline, hybrid BM25+vector recall"
 requires-python = ">=3.10"
 dependencies = [
     "lancedb>=0.20.0",
