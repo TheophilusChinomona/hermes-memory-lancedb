@@ -1,10 +1,19 @@
 # hermes-memory-lancedb
 
-LanceDB-backed persistent memory for [Hermes Agent](https://github.com/TheophilusChinomona/hermes-agent) (Athena fork). Hybrid BM25 + vector recall, cross-encoder reranking, MMR diversity, three-tier lifecycle, multi-provider embeddings, multi-scope isolation, LLM smart extraction with dedup, plus a management CLI and per-query observability.
+Pluggable persistent memory for [Hermes Agent](https://github.com/TheophilusChinomona/hermes-agent) (Athena fork). Hybrid BM25 + vector recall, cross-encoder reranking, MMR diversity, three-tier lifecycle, multi-provider embeddings, multi-scope isolation, LLM smart extraction with dedup, management CLI, and per-query observability — over either **LanceDB** (default, embedded) or **Postgres + pgvector + pg_search** (server-side, runs on any CPU).
 
-This is the Python port of [memory-lancedb-pro](https://github.com/TheophilusChinomona/memory-lancedb-pro) (TypeScript). Drop-in for the bundled `lancedb` plugin in Athena's `plugins/memory/lancedb/`.
+Python port of [memory-lancedb-pro](https://github.com/TheophilusChinomona/memory-lancedb-pro) (TypeScript). Drop-in for the bundled `lancedb` plugin in Athena's `plugins/memory/lancedb/`.
+
+> **Heads up — name vs. scope:** the package is still named `hermes-memory-lancedb` for backwards compatibility, but as of v2.0.0 it's a multi-backend memory plugin. A rename is planned once both backends are battle-tested.
 
 ## Features
+
+**Pluggable storage backends (v2.0.0 — P6)**
+- `MemoryStore` ABC with two impls: `LanceDBStore` (embedded LanceDB; needs AVX2 host) and `PgvectorStore` (Postgres + pgvector + pg_search via the [ParadeDB](https://www.paradedb.com/) image; runs on any CPU)
+- Selection via `HERMES_MEMORY_BACKEND={lancedb,pgvector}` (auto-detect: if `HERMES_MEMORY_DATABASE_URL` is set, defaults to pgvector)
+- LanceDB and pgvector ship as **optional extras** — base install pulls neither, so AVX2-less hosts can `pip install ".[pgvector]"` without LanceDB's native binary
+- Pipeline (rerank, MMR, length-norm, dedup, scope filtering) is backend-agnostic — same retrieval quality on both
+- Pgvector backend uses `pg_search` BM25 (tantivy under the hood — same engine LanceDB's FTS uses) when available, falls back to `tsvector` + `ts_rank_cd` on vanilla pgvector
 
 **Management & observability (v1.7.0 — P5)**
 - Console CLI: `hermes-memory-lancedb {list,search,stats,delete,delete-bulk,export,import,import-markdown,reembed,migrate,reindex-fts,version}`
@@ -60,19 +69,46 @@ This is the Python port of [memory-lancedb-pro](https://github.com/TheophilusChi
 
 ## Install
 
-Not on PyPI. Install from git:
+Not on PyPI. Install from git, picking the backend extras you want:
 
 ```bash
-pip install "hermes-memory-lancedb @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@main"
+# LanceDB backend (default, requires host CPU with AVX2 — Intel ≥ Haswell 2013, AMD ≥ Excavator 2015)
+pip install "hermes-memory-lancedb[lancedb] @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@main"
+
+# Postgres + pgvector backend (any CPU; needs a Postgres server with the vector extension — ParadeDB image strongly recommended for pg_search BM25)
+pip install "hermes-memory-lancedb[pgvector] @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@main"
+
+# Both
+pip install "hermes-memory-lancedb[lancedb,pgvector] @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@main"
 ```
 
-Or pin to a tag:
+Pin to a tag with `@v2.0.0` instead of `@main`.
 
-```bash
-pip install "hermes-memory-lancedb @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@v1.7.0"
+Base requirements: Python ≥ 3.10, `openai`, `pyarrow`, `httpx`, `click`, `portalocker`. Backend extras add `lancedb`+`tantivy` or `psycopg[binary,pool]`.
+
+### Backend selection matrix
+
+| Want | Set | Notes |
+|---|---|---|
+| LanceDB (embedded, default) | nothing — or `HERMES_MEMORY_BACKEND=lancedb` | Storage at `$LANCEDB_PATH` |
+| Postgres + pgvector | `HERMES_MEMORY_DATABASE_URL=postgresql://...` | Auto-detected; backend becomes `pgvector` |
+| Force pgvector even with URL unset | `HERMES_MEMORY_BACKEND=pgvector` + `HERMES_MEMORY_DATABASE_URL=...` | Same as above; explicit |
+| Force LanceDB even with URL set | `HERMES_MEMORY_BACKEND=lancedb` | Useful for A/B tests |
+
+### Pgvector backend setup
+
+The plugin creates its own schema (`hermes_memory.memories`) inside whatever DB you point it at — no name clashes with existing tables. On first connect it runs:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;     -- pgvector
+CREATE EXTENSION IF NOT EXISTS pg_search;  -- ParadeDB BM25 (skipped silently if not available)
+CREATE SCHEMA IF NOT EXISTS hermes_memory;
+CREATE TABLE hermes_memory.memories (...);
+CREATE INDEX ... USING hnsw (vector vector_cosine_ops) WITH (m=16, ef_construction=64);
+CREATE INDEX ... USING bm25 (id, content) WITH (key_field='id');  -- or GIN tsvector fallback
 ```
 
-Runtime requirements: Python ≥ 3.10, `lancedb ≥ 0.20`, `tantivy ≥ 0.21`, `openai ≥ 1.0`, `pyarrow ≥ 12`, `click ≥ 8.0`, `portalocker ≥ 2.7`, `httpx` (transitively via `openai`).
+Concurrency is handled by Postgres advisory locks (no `portalocker` files for pgvector mode).
 
 ## Activate in Hermes
 
@@ -89,8 +125,12 @@ The bundled plugin shim at `plugins/memory/lancedb/__init__.py` (in `hermes-agen
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
+| **Backend selection** | | |
+| `HERMES_MEMORY_BACKEND` | auto | `lancedb` or `pgvector`. Auto-detects pgvector when `HERMES_MEMORY_DATABASE_URL` is set |
+| `HERMES_MEMORY_DATABASE_URL` | unset | Postgres connection URL (URL-encode special chars in the password). Required for pgvector backend |
+| **Embedding** | | |
 | `OPENAI_API_KEY` | required for default provider | OpenAI embeddings + LLM extraction (`gpt-4o-mini`) |
-| `LANCEDB_PATH` | `$HERMES_HOME/lancedb` | Storage directory |
+| `LANCEDB_PATH` | `$HERMES_HOME/lancedb` | LanceDB storage directory (lancedb backend only) |
 | `LANCEDB_EMBED_PROVIDER` | `openai` | One of `openai` / `openrouter` / `jina` / `gemini` / `ollama` / `openai-compatible` |
 | `LANCEDB_EMBED_MODEL` | provider default | Override embedding model id |
 | `LANCEDB_EMBED_DIM` | from model id | Explicit embedding dimension override |
@@ -232,6 +272,18 @@ pytest tests/
 | P3 — Reflection subsystem (event store, item store, ranking, retry, slices) | Done (v1.5.0) |
 | P4 — Lifecycle module, temporal classifier, session compactor, memory compactor, auto-capture cleanup, intent + query expansion | Done (v1.6.0) |
 | P5 — Management CLI, retrieval observability, markdown import, A/B reembed, file locking | Done (v1.7.0) |
+| P6 — Pluggable storage backends (`MemoryStore` ABC, `LanceDBStore`, `PgvectorStore` with pg_search BM25) | Done (v2.0.0) |
+
+### Deployment notes
+
+| Host hardware | Recommended backend | Why |
+|---|---|---|
+| Modern CPU with AVX2 (Intel ≥ Haswell 2013, AMD ≥ Excavator 2015) | LanceDB (default) | Embedded, no external DB, lower latency |
+| Older CPU without AVX2 (Sandy Bridge, etc.) | pgvector (ParadeDB) | LanceDB native binary SIGILLs on import; route storage server-side |
+| Multiple Athena instances sharing memory | pgvector | Postgres ACID + advisory locks vs file lock; cleaner concurrency story |
+| Embedded/single-process, no DB to manage | LanceDB | Zero infra |
+
+For pgvector mode the recommended Postgres image is `paradedb/paradedb:latest` (ships `pg_search` for true BM25). On vanilla pgvector the plugin transparently falls back to `tsvector` ranking.
 
 ### P3 — Reflection subsystem (v1.5.0)
 
