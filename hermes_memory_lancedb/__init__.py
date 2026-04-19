@@ -1,8 +1,85 @@
-"""hermes-memory-lancedb v1.2.0 — LanceDB vector memory plugin for Hermes agents.
+"""hermes-memory-lancedb v1.6.0 — LanceDB vector memory plugin for Hermes agents.
 
-Hybrid BM25 + vector recall, Weibull decay, OpenAI text-embedding-3-small.
+Hybrid BM25 + vector recall, Weibull decay, multi-provider embeddings.
 
-v1.2.0 additions (P0 of memory-lancedb-pro port — retrieval quality):
+v1.6.0 additions (P4 of memory-lancedb-pro port — lifecycle and ops):
+  - lifecycle.py: TierManager + DecayEngine extracted from inline tier_evaluate
+  - temporal.py: static vs dynamic classifier; dynamic memories decay 3x faster
+  - sessions.py: end-of-session compression + recovery on reopen
+  - compactor.py: periodic cluster-merge of near-duplicate memories
+  - auto_capture.py: cleanup pass for the previous session's auto-captures
+  - query.py: intent analyzer + query expansion (BM25 fan-out across synonyms)
+  - New tool: lancedb_compact (also auto-runs every LANCEDB_COMPACT_EVERY_N writes)
+  - New schema column: temporal_type
+
+v1.5.0 additions (P3 of memory-lancedb-pro port — reflection subsystem):
+  - Reflection store: separate `reflections` LanceDB table with own schema + FTS index
+  - Event store + item store + ranker + retry + slice loaders
+  - Provider hooks: lazy init (LANCEDB_REFLECTION_ENABLED), session_end capture,
+    optional merge into _hybrid_search results with `source: "reflection"` marker
+  - New tools: lancedb_reflect, lancedb_reflections
+
+v1.4.0 additions (P2 of memory-lancedb-pro port — write pipeline):
+  - Long-content chunking with paragraph/sentence boundaries + overlap
+  - Batch LLM dedup (single call vs pairwise)
+  - Admission controller with rolling stats (rate limiting, similarity
+    gating against recent rejects)
+  - Smart metadata extraction (temporal_type, confidence, sensitivity)
+  - Noise prototype filter (vector-based, complements regex _is_noise)
+  - New schema columns: metadata (JSON), parent_id (chunk grouping)
+
+v1.3.0 additions (P1 of memory-lancedb-pro port — multi-tenancy):
+  - Multi-scope isolation: agent / user / project / team / workspace
+    columns compose orthogonally in the search predicate
+  - Multi-provider embeddings: OpenAI (default), Jina, Gemini, Ollama,
+    plus any OpenAI-compatible endpoint via LANCEDB_EMBED_BASE_URL
+  - Schema migration adds scope columns to existing tables
+  - Embedding dimension is provider-driven (no longer hardcoded)
+
+v1.4.0 additions (P2 of memory-lancedb-pro port — write pipeline):
+  - Long-context chunker: split oversized writes on sentence boundaries with
+    overlap; chunks share a `parent_id` so retrieval can collapse them
+  - Batch dedup: pairwise cosine within a candidate batch + a single LLM call
+    over surviving candidates vs the existing pool (was 1 LLM call per pair)
+  - Admission control: rolling acceptance-rate / novelty / recency / type-prior
+    gate with a hard-reject cosine vs recent rejects; persists stats to
+    `<storage_path>/admission_stats.json`
+  - Smart metadata: per-write LLM extraction of memory_temporal_type,
+    confidence, sensitivity, modality, fact_key, tags — JSON-encoded into a
+    new `metadata` column
+  - Noise prototype filter: ~20 bundled multilingual noise prototypes; rejects
+    writes whose embedding has cosine >= 0.92 with any prototype. Combined
+    with the existing regex filter (either matcher rejects)
+
+v1.5.0 additions (P3 of memory-lancedb-pro port — reflection subsystem):
+  - Reflection subpackage (hermes_memory_lancedb.reflection) — 8 modules:
+    store, event_store, item_store, metadata, mapped_metadata, ranking,
+    retry, slices.
+  - Dedicated `reflections` LanceDB table with its own FTS index +
+    optional vector column.
+  - Recency-weighted, importance-boosted ranking (logistic decay).
+  - Lazy init via `LANCEDB_REFLECTION_ENABLED=1` (off by default for
+    backwards compat).
+  - on_session_end now captures a reflection extract in addition to memories.
+  - _hybrid_search optionally pulls top-K reflections (env-tunable).
+  - New tools: lancedb_reflect (explicit write), lancedb_reflections (search).
+
+v1.6.0 additions (P4 of memory-lancedb-pro port — lifecycle & ops):
+  - Tier manager + decay engine extracted into ``lifecycle`` module with
+    importance-modulated half-life and ``apply_search_boost``
+  - Temporal classifier (``static`` vs ``dynamic``); dynamic memories
+    decay 3x faster (``temporal`` module + new schema column)
+  - Session compressor + recovery: end-of-session summary + start-of-session
+    re-inflation (``sessions`` module)
+  - Memory compactor: cluster-and-merge near-duplicates; new
+    ``lancedb_compact`` tool + auto-trigger every N writes
+    (``LANCEDB_COMPACT_EVERY_N`` env var)
+  - Auto-capture cleanup: scrubs previous session's noisy auto-captures at
+    session start (``auto_capture`` module)
+  - Intent analyzer + query expander: pre-search rules expand short queries
+    with synonyms and route to category boosts (``query`` module)
+
+v1.2.0 additions (P0 — retrieval quality):
   - Cross-encoder reranking via Jina (fallback: cosine of query vs doc vectors)
   - MMR diversity: defer near-duplicate hits (cosine > 0.85) to end
   - Length normalization: log2 penalty for entries longer than 500 chars
@@ -18,7 +95,7 @@ v1.1.0 additions (ported from memory-lancedb-pro TypeScript fork):
   - New tools: lancedb_forget, lancedb_stats
 
 Storage:    $LANCEDB_PATH  or  $HERMES_HOME/lancedb/
-Embeddings: OpenAI text-embedding-3-small — OPENAI_API_KEY required
+Embeddings: $LANCEDB_EMBED_PROVIDER (default openai/text-embedding-3-small)
 Extraction: gpt-4o-mini (configurable via lancedb.json extraction_model)
 
 Activate in ~/.hermes/config.yaml:
@@ -28,6 +105,7 @@ Activate in ~/.hermes/config.yaml:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -37,9 +115,56 @@ import re
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .embedders import (
+    EMBEDDING_DIMENSIONS,
+    Embedder,
+    EmbeddingError,
+    PROVIDER_DEFAULT_MODEL,
+    get_provider_from_env,
+    is_provider_available,
+    make_embedder,
+)
+from .scopes import (
+    GLOBAL_SCOPE,
+    SCOPE_COLUMN_DEFAULTS,
+    SCOPE_COLUMNS,
+    ScopeManager,
+    clawteam_scopes_from_env,
+    parse_agent_id_from_session_key,
+)
+from . import reflection as _reflection
+from .reflection import (
+    BuildReflectionStorePayloadsParams,
+    ReflectionErrorSignalLike,
+    ReflectionEventStore,
+    ReflectionItemStore,
+    ReflectionRanker,
+    ReflectionStore,
+)
+
 logger = logging.getLogger(__name__)
+
+# v1.4.0 (P2) modules
+from .chunker import chunk_text  # noqa: E402
+from .dedup import batch_dedup  # noqa: E402
+from .admission import AdmissionController  # noqa: E402
+from .smart_metadata import extract_smart_metadata, stringify_smart_metadata  # noqa: E402
+from .noise_proto import NoisePrototypeFilter  # noqa: E402
+
+# v1.6.0 (P4) submodules — lifecycle, temporal, sessions, compactor, auto-capture, query.
+from . import lifecycle as _lifecycle  # noqa: E402
+from . import temporal as _temporal  # noqa: E402
+from . import sessions as _sessions  # noqa: E402
+from . import compactor as _compactor  # noqa: E402
+from . import auto_capture as _auto_capture  # noqa: E402
+from . import query as _query  # noqa: E402
+
+# v1.7.0 (P5) — observability classes re-exported so callers can use them
+# without a deeper import.
+from .observability import RetrievalStats, RetrievalTrace  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # MemoryProvider base
@@ -80,8 +205,8 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 _TABLE_NAME = "memories"
-_EMBED_MODEL = "text-embedding-3-small"
-_EMBED_DIM = 1536
+_EMBED_MODEL = "text-embedding-3-small"  # legacy default; see embedders.make_embedder
+_EMBED_DIM = 1536  # legacy default; the schema is built from the active embedder's dim
 _TOP_K_VECTOR = 20
 _TOP_K_BM25 = 20
 _TOP_K_RETURN = 6
@@ -90,6 +215,10 @@ _RRF_K = 60
 _WEIBULL_SCALE = 30.0
 _WEIBULL_SHAPE = 0.7
 _DECAY_THRESHOLD = 0.05
+# Dynamic memories decay this many times faster than static (see temporal classifier).
+_DYNAMIC_DECAY_MULTIPLIER = 3.0
+# Default auto-trigger threshold for the memory compactor (writes between runs).
+_DEFAULT_COMPACT_EVERY_N = 100
 
 # v1.2.0 retrieval pipeline tuning
 _LENGTH_NORM_ANCHOR = 500
@@ -111,6 +240,9 @@ _DEFAULT_EXTRACTION_MODEL = "gpt-4o-mini"
 # Tier decay floors applied during search
 _TIER_DECAY_FLOOR = {"core": 0.9, "working": 0.7, "peripheral": 0.0}
 
+# How long writers wait for a sibling Hermes process to release the table lock.
+_WRITE_LOCK_TIMEOUT_S = 30.0
+
 # Tier promotion / demotion thresholds
 _PROMO_PERI_TO_WORK_ACCESS = 3
 _PROMO_PERI_TO_WORK_COMPOSITE = 0.4
@@ -123,17 +255,24 @@ _DEMO_AGE_ACCESS_THRESHOLD = 3
 
 MEMORY_CATEGORIES = ["profile", "preferences", "entities", "events", "cases", "patterns"]
 
+# v1.4.0 P2 — write-pipeline tuning
+_CHUNK_TRIGGER_CHARS = 1800   # split contents longer than this into chunks
+_CHUNK_MAX_CHARS = 1500
+_CHUNK_OVERLAP = 200
+_BATCH_DEDUP_POOL_SIZE = 6     # how many existing memories to surface per candidate
+_NOISE_PROTO_THRESHOLD = 0.92  # cosine >= this => noise (matches TS)
+
 
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
 
-def _get_schema():
+def _get_schema(embed_dim: int = _EMBED_DIM):
     import pyarrow as pa
     return pa.schema([
         pa.field("id", pa.string()),
         pa.field("content", pa.string()),
-        pa.field("vector", pa.list_(pa.float32(), _EMBED_DIM)),
+        pa.field("vector", pa.list_(pa.float32(), embed_dim)),
         pa.field("timestamp", pa.float64()),
         pa.field("source", pa.string()),
         pa.field("session_id", pa.string()),
@@ -146,6 +285,17 @@ def _get_schema():
         pa.field("category", pa.string()),
         pa.field("abstract", pa.string()),
         pa.field("overview", pa.string()),
+        # v1.3.0 P1 — multi-scope columns (all nullable strings)
+        pa.field("agent_id", pa.string()),
+        pa.field("project_id", pa.string()),
+        pa.field("team_id", pa.string()),
+        pa.field("workspace_id", pa.string()),
+        pa.field("scope", pa.string()),
+        # v1.4.0 P2 fields
+        pa.field("metadata", pa.string()),   # JSON-encoded smart metadata
+        pa.field("parent_id", pa.string()),  # links chunked rows to their source
+        # v1.6.0 P4 fields
+        pa.field("temporal_type", pa.string()),  # "static" or "dynamic"
     ])
 
 
@@ -262,6 +412,56 @@ def _build_session_extraction_prompt(messages: List[Dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Reflection prompt (P3)
+# ---------------------------------------------------------------------------
+
+_REFLECTION_SYSTEM = """You are a reflection writer for an AI agent. Read the session and produce a structured markdown reflection in EXACTLY this format:
+
+## Invariants
+- <stable rule that should hold across all future sessions>
+
+## Derived
+- <session-specific change or delta to apply next run>
+
+## User model deltas (about the human)
+- <preference change>
+
+## Agent model deltas (about the assistant/system)
+- <new self-knowledge>
+
+## Lessons & pitfalls (symptom / cause / fix / prevention)
+- <bullet>
+
+## Decisions (durable)
+- <decision>
+
+## Open loops / next actions
+- <follow-up>
+
+Rules:
+- Each section is optional — omit a section entirely if you have nothing useful for it.
+- Bullets must start with "- ".
+- Keep each bullet to one short sentence.
+- Do NOT include reasoning, preamble, or explanations.
+- If the session is too short or contains nothing reflection-worthy, return an empty string."""
+
+
+def _build_reflection_prompt(messages: List[Dict]) -> str:
+    lines = []
+    for m in messages:
+        role = m.get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        if content.strip():
+            lines.append(f"{role.capitalize()}: {content.strip()[:800]}")
+    combined = "\n".join(lines)
+    return f"Write a reflection for this session:\n\n{combined[:10000]}"
+
+
+# ---------------------------------------------------------------------------
 # Dedup prompt
 # ---------------------------------------------------------------------------
 
@@ -301,26 +501,20 @@ def _tier_evaluate(
     decay_weight: float,
     age_days: float,
 ) -> Optional[str]:
-    """Return new tier if promotion/demotion warranted, else None."""
-    composite = _composite_score(decay_weight, importance)
+    """Backwards-compat wrapper around :class:`lifecycle.TierManager`.
 
-    if current_tier == "peripheral":
-        if access_count >= _PROMO_PERI_TO_WORK_ACCESS and composite >= _PROMO_PERI_TO_WORK_COMPOSITE:
-            return "working"
-
-    elif current_tier == "working":
-        if (access_count >= _PROMO_WORK_TO_CORE_ACCESS
-                and composite >= _PROMO_WORK_TO_CORE_COMPOSITE
-                and importance >= _PROMO_WORK_TO_CORE_IMPORTANCE):
-            return "core"
-        if composite < _DEMO_COMPOSITE_THRESHOLD or (age_days > _DEMO_AGE_DAYS and access_count < _DEMO_AGE_ACCESS_THRESHOLD):
-            return "peripheral"
-
-    elif current_tier == "core":
-        if composite < _DEMO_COMPOSITE_THRESHOLD and access_count < _DEMO_AGE_ACCESS_THRESHOLD:
-            return "working"
-
-    return None
+    Returns the new tier if a promotion/demotion is warranted, else ``None``.
+    The v1.1.0 inline implementation lived here; v1.6.0 (P4) extracts the
+    real logic into :mod:`hermes_memory_lancedb.lifecycle` so this function
+    is now a thin shim.
+    """
+    return _lifecycle.tier_evaluate_legacy(
+        current_tier=current_tier,
+        access_count=access_count,
+        importance=importance,
+        decay_weight=decay_weight,
+        age_days=age_days,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +757,59 @@ def _rerank_cosine_fallback(
         return hits
 
 
+@contextlib.contextmanager
+def _with_lock(table_path: str, *, timeout: float = _WRITE_LOCK_TIMEOUT_S):
+    """Cross-process file lock around a LanceDB table directory.
+
+    Uses ``portalocker`` so multiple Hermes processes can share the same
+    LanceDB without corrupting each other's writes. The lock file lives next
+    to the table directory and is created on demand.
+
+    Falls back to a no-op when ``portalocker`` is not installed (so the
+    package still works in minimal environments — just without
+    cross-process safety).
+    """
+    try:
+        import portalocker
+    except ImportError:
+        logger.debug("portalocker not installed; running without cross-process lock")
+        yield None
+        return
+
+    lock_path = Path(table_path).expanduser().with_suffix(".lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.debug("could not create lock dir %s: %s", lock_path.parent, e)
+        yield None
+        return
+
+    fh = open(lock_path, "a+")
+    try:
+        try:
+            portalocker.lock(
+                fh,
+                portalocker.LOCK_EX,
+                timeout=timeout,
+            )
+        except Exception as e:
+            logger.warning("file lock at %s timed out/failed: %s", lock_path, e)
+            yield None
+            return
+        try:
+            yield fh
+        finally:
+            try:
+                portalocker.unlock(fh)
+            except Exception:
+                pass
+    finally:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
 def _msg_text(msg: Dict) -> str:
     content = msg.get("content", "")
     if isinstance(content, str):
@@ -573,15 +820,21 @@ def _msg_text(msg: Dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Embedding client
+# Embedding client (legacy shim — kept for backward compatibility with tests
+# that monkey-patch `hermes_memory_lancedb._EmbedClient`. New code goes
+# through `hermes_memory_lancedb.embedders.make_embedder()`.)
 # ---------------------------------------------------------------------------
 
 class _EmbedClient:
+    """Legacy thin OpenAI embedder. Kept for back-compat with v1.1.0/v1.2.0 tests."""
+
     def __init__(self, api_key: str):
         from openai import OpenAI
         self._client = OpenAI(api_key=api_key)
         self._cache: Dict[str, List[float]] = {}
         self._lock = threading.Lock()
+        self.dimensions = _EMBED_DIM
+        self.model = _EMBED_MODEL
 
     def embed(self, text: str) -> List[float]:
         key = hashlib.md5(text.encode()).hexdigest()
@@ -671,9 +924,20 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
     def __init__(self):
         self._db = None
         self._table = None
-        self._embedder: Optional[_EmbedClient] = None
+        self._embedder: Optional[Embedder] = None
         self._llm: Optional[_LLMClient] = None
         self._user_id = "andrew"
+        # P1 scope identifiers (all optional; empty string == no filter)
+        self._agent_id: str = ""
+        self._project_id: str = ""
+        self._team_id: str = ""
+        self._workspace_id: str = ""
+        self._scope_manager: ScopeManager = ScopeManager()
+        # Tracks whether the active table has the new scope columns. Set
+        # during initialize() / _migrate_schema_if_needed() and consulted
+        # by _hybrid_search to choose between legacy and composable filters.
+        self._has_scope_columns: bool = True
+        self._embed_dim: int = _EMBED_DIM
         self._session_id = ""
         self._storage_path = ""
         self._extraction_model = _DEFAULT_EXTRACTION_MODEL
@@ -684,13 +948,37 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._extract_queue: List[Dict] = []
         self._extract_lock = threading.Lock()
         self._extract_thread: Optional[threading.Thread] = None
+        # v1.4.0 P2 — admission control + noise prototype filter
+        self._admission: Optional[AdmissionController] = None
+        self._noise_proto: Optional[NoisePrototypeFilter] = None
+        self._smart_metadata_enabled: bool = True
+
+        # Reflection subsystem (P3) — disabled by default for backwards compat.
+        # Enable with LANCEDB_REFLECTION_ENABLED=1.
+        self._reflection_store: Optional[ReflectionStore] = None
+        self._reflection_event_store: ReflectionEventStore = ReflectionEventStore()
+        self._reflection_item_store: ReflectionItemStore = ReflectionItemStore()
+        self._reflection_ranker: ReflectionRanker = ReflectionRanker()
+
+        # P4: memory compactor auto-trigger
+        try:
+            every_n = int(os.environ.get("LANCEDB_COMPACT_EVERY_N", str(_DEFAULT_COMPACT_EVERY_N)))
+        except (TypeError, ValueError):
+            every_n = _DEFAULT_COMPACT_EVERY_N
+        self._compactor_trigger = _compactor.CompactionTrigger(every_n=every_n)
+        # P4: recovered-context block exposed via system_prompt_block().
+        self._recovered_context = ""
+
+        # v1.7.0 P5: observability — accumulated stats across queries.
+        self._stats = RetrievalStats(max_records=1000)
 
     @property
     def name(self) -> str:
         return "lancedb"
 
     def is_available(self) -> bool:
-        return bool(os.environ.get("OPENAI_API_KEY"))
+        provider = get_provider_from_env()
+        return is_provider_available(provider)
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -739,6 +1027,31 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._user_id = kwargs.get("user_id") or cfg.get("user_id", "andrew")
         self._extraction_model = cfg.get("extraction_model", _DEFAULT_EXTRACTION_MODEL)
 
+        # P1 scope identifiers (all optional). Read from kwargs first, then
+        # env vars (LANCEDB_AGENT_ID, LANCEDB_PROJECT_ID, etc.), else "".
+        self._agent_id = (
+            kwargs.get("agent_id") or os.environ.get("LANCEDB_AGENT_ID", "")
+            or parse_agent_id_from_session_key(session_id) or ""
+        )
+        self._project_id = kwargs.get("project_id") or os.environ.get("LANCEDB_PROJECT_ID", "")
+        self._team_id = kwargs.get("team_id") or os.environ.get("LANCEDB_TEAM_ID", "")
+        self._workspace_id = kwargs.get("workspace_id") or os.environ.get("LANCEDB_WORKSPACE_ID", "")
+
+        # Apply CLAWTEAM_MEMORY_SCOPE env extension (no-op if unset)
+        self._scope_manager = ScopeManager()
+        clawteam = clawteam_scopes_from_env()
+        if clawteam:
+            self._scope_manager.apply_clawteam_scopes(clawteam)
+
+        # Build the embedder via the multi-provider factory.
+        try:
+            self._embedder = make_embedder()
+            self._embed_dim = self._embedder.dimensions
+        except EmbeddingError as e:
+            logger.warning("LanceDB embedder init failed: %s", e)
+            self._ready = False
+            return
+
         try:
             import lancedb
 
@@ -749,18 +1062,74 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 self._table = self._db.open_table(_TABLE_NAME)
                 self._migrate_schema_if_needed()
             else:
-                self._table = self._db.create_table(_TABLE_NAME, schema=_get_schema())
+                self._table = self._db.create_table(
+                    _TABLE_NAME, schema=_get_schema(self._embed_dim)
+                )
+                self._has_scope_columns = True
 
             try:
                 self._table.create_fts_index("content", replace=True)
             except Exception as e:
                 logger.debug("FTS index skipped: %s", e)
 
-            api_key = os.environ.get("OPENAI_API_KEY", "")
-            self._embedder = _EmbedClient(api_key)
-            self._llm = _LLMClient(api_key, model=self._extraction_model)
+            # LLM client still uses OpenAI for extraction/dedup.
+            llm_key = os.environ.get("OPENAI_API_KEY", "")
+            if llm_key:
+                self._llm = _LLMClient(llm_key, model=self._extraction_model)
+            else:
+                self._llm = None
+                logger.debug(
+                    "OPENAI_API_KEY not set — LLM extraction/dedup disabled (raw turn fallback only)"
+                )
+
+            # v1.4.0 P2: admission controller + noise prototype filter.
+            # Both default ON; flip via env vars to disable for tests/CI.
+            admission_enabled = os.environ.get(
+                "LANCEDB_ADMISSION_ENABLED", "1"
+            ).lower() not in ("0", "false", "no")
+            self._admission = AdmissionController(
+                self._storage_path, enabled=admission_enabled,
+            )
+            self._smart_metadata_enabled = os.environ.get(
+                "LANCEDB_SMART_METADATA", "1"
+            ).lower() not in ("0", "false", "no")
+            self._noise_proto = NoisePrototypeFilter(self._storage_path)
+            try:
+                self._noise_proto.load_or_init(self._embedder.embed)
+            except Exception as e:
+                logger.debug("noise prototype init skipped: %s", e)
+
             self._ready = True
-            logger.info("LanceDB memory v1.1.0 initialized at %s", self._storage_path)
+            logger.info(
+                "LanceDB memory v1.6.0 initialized at %s (provider=%s, dim=%d)",
+                self._storage_path,
+                get_provider_from_env(),
+                self._embed_dim,
+            )
+
+            # P3: lazy-init the reflection store. Default off — set
+            # LANCEDB_REFLECTION_ENABLED=1 to opt in. Embedder is optional;
+            # if absent, the reflection store falls back to FTS-only.
+            if os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1":
+                self._init_reflection_store()
+
+            # P4: auto-capture cleanup for the previous session's noise + session
+            # recovery for re-opened sessions. Both run in the background to keep
+            # initialize() snappy.
+            previous_session_id = kwargs.get("previous_session_id") or ""
+            if previous_session_id:
+                threading.Thread(
+                    target=self._run_auto_capture_cleanup,
+                    args=(previous_session_id,),
+                    daemon=True,
+                    name="lancedb-cleanup",
+                ).start()
+            threading.Thread(
+                target=self._run_session_recovery,
+                args=(session_id,),
+                daemon=True,
+                name="lancedb-recovery",
+            ).start()
 
             self.queue_prefetch("current targets prospects contacts plans tasks decisions")
 
@@ -768,39 +1137,239 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             logger.warning("LanceDB memory init failed: %s", e, exc_info=True)
             self._ready = False
 
+    # --- Reflection subsystem (P3) ---------------------------------------
+
+    def _init_reflection_store(self) -> None:
+        """Create and initialize the dedicated reflection store.
+
+        Embedder is optional — if missing, the reflection store falls back to
+        BM25/FTS only. Failures are logged but never block the main provider.
+        """
+        try:
+            embed_fn = self._embedder.embed if self._embedder is not None else None
+            self._reflection_store = ReflectionStore(
+                storage_path=self._storage_path,
+                embedder=embed_fn,
+            )
+            ok = self._reflection_store.initialize()
+            if ok:
+                logger.info("LanceDB reflection store initialized at %s", self._storage_path)
+            else:
+                logger.warning("LanceDB reflection store init returned False; reflections disabled.")
+                self._reflection_store = None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Reflection store init failed: %s", e, exc_info=True)
+            self._reflection_store = None
+
+    def _capture_reflection_at_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Build a reflection-shaped markdown summary from session messages
+        and persist it via the reflection store.
+
+        Mirrors the P3 contract: an LLM call extracts lessons-learned in the
+        reflection markdown schema (Invariants / Derived / Lessons / etc.)
+        and the resulting payloads are written to the dedicated table.
+        """
+        if (
+            self._reflection_store is None
+            or not self._reflection_store.is_ready
+            or self._llm is None
+        ):
+            return
+
+        try:
+            prompt = _build_reflection_prompt(messages)
+            reflection_md = self._llm.chat(_REFLECTION_SYSTEM, prompt, max_tokens=1500)
+            if not reflection_md or not reflection_md.strip():
+                return
+            params = BuildReflectionStorePayloadsParams(
+                reflection_text=reflection_md,
+                session_key=os.environ.get("LANCEDB_REFLECTION_SESSION_KEY", self._session_id or "session"),
+                session_id=self._session_id or "session",
+                agent_id=self._user_id,
+                command=os.environ.get("LANCEDB_REFLECTION_COMMAND", "session_end"),
+                scope=os.environ.get("LANCEDB_REFLECTION_SCOPE", "global"),
+                tool_error_signals=[],
+                run_at=time.time() * 1000.0,
+                used_fallback=False,
+                write_legacy_combined=True,
+            )
+            result = self._reflection_store.write_reflection(params)
+            # Mirror to in-memory event/item stores for downstream lookups.
+            try:
+                from .reflection import build_reflection_event_payload as _build_event
+                ev = _build_event(
+                    scope=params.scope,
+                    session_key=params.session_key,
+                    session_id=params.session_id,
+                    agent_id=params.agent_id,
+                    command=params.command,
+                    tool_error_signals=[],
+                    run_at=params.run_at,
+                    used_fallback=False,
+                    event_id=result.get("event_id"),
+                )
+                self._reflection_event_store.append(ev)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Reflection capture failed: %s", e)
+
+    def _search_reflections(self, query: str, *, top_k: int = 3) -> List[Dict]:
+        """Return top-K reflections for ``query`` as result-shaped dicts.
+
+        Each hit is annotated with ``source: "reflection"`` so callers can
+        distinguish reflection-merged results from regular memory results.
+        """
+        store = self._reflection_store
+        if store is None or not store.is_ready or not query:
+            return []
+        try:
+            hits = store.search(query, top_k=top_k)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Reflection search failed: %s", e)
+            return []
+        out: List[Dict] = []
+        for h in hits:
+            out.append({
+                "id": h.id,
+                "content": h.text,
+                "abstract": h.text[:80],
+                "timestamp": h.timestamp,
+                "decay_weight": 1.0,
+                "source": "reflection",
+                "tier": "reflection",
+                "category": "reflection",
+                "access_count": 0,
+                "importance": h.importance,
+                "vector": None,
+                "score": h.score,
+                "kind": h.kind,
+                "scope": h.scope,
+                "event_id": h.event_id,
+            })
+        return out
+
+    def _run_auto_capture_cleanup(self, previous_session_id: str) -> None:
+        """Background hook: cleanup auto-captures from a previous session."""
+        try:
+            report = _auto_capture.cleanup_auto_captures(
+                session_id=previous_session_id,
+                store=self,
+                user_id=self._user_id,
+            )
+            logger.info(
+                "Auto-capture cleanup for session %s: scanned=%d deleted=%d demoted=%d cleaned=%d",
+                previous_session_id,
+                report.scanned,
+                report.deleted,
+                report.demoted,
+                report.cleaned,
+            )
+        except Exception as e:
+            logger.debug("Auto-capture cleanup failed: %s", e)
+
+    def _run_session_recovery(self, session_id: str) -> None:
+        """Background hook: pull compressed entries for the current session_id
+        and stash a formatted block for ``system_prompt_block`` to include."""
+        try:
+            entries = _sessions.recover_session(
+                session_id=session_id,
+                store=self,
+                user_id=self._user_id,
+            )
+            if entries:
+                self._recovered_context = _sessions.format_recovered(entries)
+                logger.info("Recovered %d compressed entries for session %s",
+                            len(entries), session_id)
+        except Exception as e:
+            logger.debug("Session recovery failed: %s", e)
+
     def _migrate_schema_if_needed(self) -> None:
         if self._table is None:
             return
         try:
             existing_cols = {f.name for f in self._table.schema}
-            new_fields = {
+            # v1.1.0 fields
+            v110_fields = {
                 "tier": "'peripheral'",
                 "importance": "0.5",
                 "access_count": "0",
                 "category": "'general'",
                 "abstract": "''",
                 "overview": "''",
+                # v1.4.0 P2
+                "metadata": "''",
+                "parent_id": "''",
+                # v1.6.0 P4
+                "temporal_type": "'static'",
             }
+            # v1.3.0 P1 — multi-scope columns
+            scope_fields = dict(SCOPE_COLUMN_DEFAULTS)
+            new_fields = {**v110_fields, **scope_fields}
             missing = {k: v for k, v in new_fields.items() if k not in existing_cols}
             if missing:
-                self._table.add_columns(missing)
-                logger.info("LanceDB schema migrated: added columns %s", list(missing.keys()))
+                # P5: wrap migration in the table lock so two Hermes processes
+                # can't try to add the same columns simultaneously.
+                table_path = os.path.join(self._storage_path, _TABLE_NAME)
+                with _with_lock(table_path):
+                    # Re-check after acquiring the lock — another process may
+                    # have already migrated.
+                    existing_cols = {f.name for f in self._table.schema}
+                    missing = {k: v for k, v in new_fields.items() if k not in existing_cols}
+                    if missing:
+                        self._table.add_columns(missing)
+                        logger.info("LanceDB schema migrated: added columns %s", list(missing.keys()))
+            # P1: determine whether scope columns are now present (either pre-existing
+            # or just-added). Used to choose between legacy `user_id`-only
+            # filtering and the composable scope filter.
+            updated_cols = {f.name for f in self._table.schema}
+            self._has_scope_columns = all(c in updated_cols for c in SCOPE_COLUMNS)
         except Exception as e:
             logger.warning("LanceDB schema migration failed (reads will use defaults): %s", e)
+            # Be conservative — without confirmed migration, assume legacy schema.
+            try:
+                cols = {f.name for f in self._table.schema}
+                self._has_scope_columns = all(c in cols for c in SCOPE_COLUMNS)
+            except Exception:
+                self._has_scope_columns = False
+
+    # ----- v1.7.0 observability accessors ---------------------------------
+
+    def get_stats(self) -> Dict:
+        """Return rolling aggregate retrieval stats (zero-cost when empty)."""
+        return self._stats.get_stats()
+
+    def reset_stats(self) -> None:
+        """Reset the rolling stats buffer."""
+        self._stats.reset()
+
+    @property
+    def storage_path(self) -> str:
+        return self._storage_path
+
+    @property
+    def table(self):
+        """Direct access to the underlying LanceDB table (for CLI commands)."""
+        return self._table
 
     def system_prompt_block(self) -> str:
         if not self._ready:
             return ""
-        return (
+        block = (
             "# LanceDB Memory\n"
-            "You have persistent vector memory across sessions (v1.1.0 — tiered, categorised). "
+            "You have persistent vector memory across sessions (v1.6.0 — tiered, "
+            "categorised, temporal-aware). "
             "Call lancedb_search before most responses — any question, task, or topic "
             "may have relevant context from previous sessions. "
             "Default to searching first, then answering. Only skip if the query is "
             "clearly self-contained (e.g. a simple calculation or format request). "
             "Do not fabricate from training knowledge when memory may have the answer. "
-            "Use lancedb_remember to store durable facts explicitly."
+            "Use lancedb_remember to store durable facts explicitly. "
+            "Use lancedb_compact periodically to merge near-duplicate entries."
         )
+        if self._recovered_context:
+            block += "\n\n" + self._recovered_context
+        return block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -825,30 +1394,83 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="lancedb-prefetch")
         self._prefetch_thread.start()
 
-    def _hybrid_search(self, query: str, top_k: int = _TOP_K_RETURN) -> List[Dict]:
+    def _build_scope_where(self) -> str:
+        """Compose the SQL WHERE predicate for the active scope identifiers."""
+        return self._scope_manager.build_where_clause(
+            agent_id=self._agent_id or None,
+            user_id=self._user_id or None,
+            project_id=self._project_id or None,
+            team_id=self._team_id or None,
+            workspace_id=self._workspace_id or None,
+            scope_columns_present=self._has_scope_columns,
+            legacy_user_id=self._user_id or None,
+        )
+
+    def _hybrid_search(
+        self,
+        query: str,
+        top_k: int = _TOP_K_RETURN,
+        *,
+        trace: Optional["RetrievalTrace"] = None,
+    ) -> List[Dict]:
         if not self._ready or self._table is None or self._embedder is None:
             return []
         try:
             vec = self._embedder.embed(query)
-            v_results = (
-                self._table.search(vec, vector_column_name="vector")
-                .where(f"user_id = '{self._user_id}'", prefilter=True)
-                .limit(_TOP_K_VECTOR)
-                .to_list()
-            )
+            where_clause = self._build_scope_where()
+            if trace is not None:
+                trace.start_stage("vector_search", input_ids=[])
+            v_search = self._table.search(vec, vector_column_name="vector")
+            if where_clause:
+                v_search = v_search.where(where_clause, prefilter=True)
+            v_results = v_search.limit(_TOP_K_VECTOR).to_list()
+            if trace is not None:
+                trace.end_stage([str(r.get("id", "")) for r in v_results])
+                trace.start_stage("bm25", input_ids=[])
+
+            # P4: query expansion — fan out BM25 across original + synonym variants,
+            # de-duplicating by id while preserving the best rank per id. Falls
+            # back to the original query if expansion misbehaves.
             try:
-                b_results = (
-                    self._table.search(query, query_type="fts")
-                    .where(f"user_id = '{self._user_id}'", prefilter=True)
-                    .limit(_TOP_K_BM25)
-                    .to_list()
-                )
+                expanded_queries = _query.expand_query(query, llm=self._llm)
+            except Exception:
+                expanded_queries = [query]
+            if not expanded_queries:
+                expanded_queries = [query]
+
+            b_results: List[Dict] = []
+            seen_ids: set = set()
+            try:
+                for q in expanded_queries[:3]:  # cap to avoid latency blow-up
+                    try:
+                        b_search = self._table.search(q, query_type="fts")
+                        if where_clause:
+                            b_search = b_search.where(where_clause, prefilter=True)
+                        rows = b_search.limit(_TOP_K_BM25).to_list()
+                    except Exception:
+                        continue
+                    for r in rows:
+                        rid = r.get("id")
+                        if rid and rid not in seen_ids:
+                            seen_ids.add(rid)
+                            b_results.append(r)
+                        if len(b_results) >= _TOP_K_BM25 * 2:
+                            break
+                    if len(b_results) >= _TOP_K_BM25 * 2:
+                        break
             except Exception:
                 b_results = []
+            if trace is not None:
+                b_ids = [str(r.get("id", "")) for r in b_results]
+                trace.end_stage(b_ids)
 
             def _hit(row) -> Optional[Dict]:
                 ts = row.get("timestamp", 0.0) or 0.0
-                base_decay = _weibull_weight(_age_days(ts))
+                age_d = _age_days(ts)
+                temporal = (row.get("temporal_type") or "").lower() or None
+                # Dynamic memories decay 3x faster: scale the effective age.
+                effective_age = age_d * _DYNAMIC_DECAY_MULTIPLIER if temporal == "dynamic" else age_d
+                base_decay = _weibull_weight(effective_age)
                 tier = row.get("tier") or "peripheral"
                 floor = _TIER_DECAY_FLOOR.get(tier, 0.0)
                 w = max(base_decay, floor)
@@ -866,17 +1488,40 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     "access_count": row.get("access_count", 0),
                     "importance": row.get("importance", 0.5),
                     "vector": row.get("vector"),
+                    "temporal_type": temporal or "static",
                 }
 
             v_hits = [h for r in v_results if (h := _hit(r))]
             b_hits = [h for r in b_results if (h := _hit(r))]
 
+            def _ids(items):
+                return [str(it.get("id", "")) for it in items]
+
+            def _scores(items):
+                return [float(it.get("score", 0.0)) for it in items]
+
             # Stage 1: RRF fusion — fetch a wider window than top_k so the
             # downstream stages (rerank/length-norm/MMR) have enough to work with.
             rerank_window = max(top_k * 4, 12)
+            if trace is not None:
+                fusion_input = list({h["id"] for h in v_hits + b_hits})
+                trace.start_stage("rrf", input_ids=fusion_input)
             merged = _merge_rrf(v_hits, b_hits, top_k=rerank_window)
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
             if not merged:
+                if trace is not None:
+                    trace.finalize(query, "hybrid")
+                    self._stats.record_query(trace, source=getattr(trace, "_source", "unknown"))
                 return []
+
+            # Stage 1b (P4): intent-based category boost. Cheap rule-based
+            # classification; LLM is only consulted if rules return "broad".
+            try:
+                intent = _query.analyze_intent(query, llm=None)  # rule-only for speed
+                merged = _query.apply_category_boost(merged, intent)
+            except Exception:
+                pass
 
             # Stage 2: Normalize RRF scores to [0, 1] so subsequent thresholds
             # (min-score, hard-min-score) operate on a meaningful scale.
@@ -892,8 +1537,15 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
 
             # Stage 4: Early min-score filter.
+            if trace is not None:
+                trace.start_stage("min_score", input_ids=_ids(merged))
             merged = [h for h in merged if h.get("score", 0.0) >= _MIN_SCORE_EARLY]
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
             if not merged:
+                if trace is not None:
+                    trace.finalize(query, "hybrid")
+                    self._stats.record_query(trace, source=getattr(trace, "_source", "unknown"))
                 return []
 
             # Stage 5: Cross-encoder rerank — Jina if API key configured,
@@ -919,24 +1571,62 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 )
             if reranked is None and rerank_provider != "none":
                 reranked = _rerank_cosine_fallback(vec, rerank_input)
+            if trace is not None:
+                trace.start_stage("rerank", input_ids=_ids(rerank_input))
             if reranked is not None:
                 merged = sorted(reranked + tail, key=lambda x: x.get("score", 0.0), reverse=True)
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
 
             # Stage 6: Length normalization (penalize sprawling entries).
+            if trace is not None:
+                trace.start_stage("length_norm", input_ids=_ids(merged))
             merged = _apply_length_normalization(merged)
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
 
             # Stage 7: Hard min-score cutoff (drops post-rerank low-confidence hits).
             try:
                 hard_min = float(os.environ.get("LANCEDB_HARD_MIN_SCORE", str(_HARD_MIN_SCORE)))
             except (TypeError, ValueError):
                 hard_min = _HARD_MIN_SCORE
+            if trace is not None:
+                trace.start_stage("hard_min_score", input_ids=_ids(merged))
             merged = [h for h in merged if h.get("score", 0.0) >= hard_min]
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
 
             # Stage 8: MMR diversity — defer near-duplicates to the tail.
+            if trace is not None:
+                trace.start_stage("mmr", input_ids=_ids(merged))
             merged = _apply_mmr_diversity(merged)
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
+
+            # Stage 9 (P3): Optionally pull top-K reflections via the
+            # reflection store and merge them in. Reflections carry
+            # source="reflection" so consumers can highlight them.
+            if self._reflection_store is not None and self._reflection_store.is_ready:
+                try:
+                    refl_top_k = max(1, int(os.environ.get("LANCEDB_REFLECTION_TOP_K", "3")))
+                except (TypeError, ValueError):
+                    refl_top_k = 3
+                refl_hits = self._search_reflections(query, top_k=refl_top_k)
+                if refl_hits:
+                    # Reflections aren't on the same RRF score scale; preserve
+                    # them by interleaving at the tail of the kept window.
+                    seen_ids = {h.get("id") for h in merged}
+                    refl_hits = [h for h in refl_hits if h.get("id") not in seen_ids]
+                    merged = merged + refl_hits
 
             # Final: take top_k.
+            if trace is not None:
+                trace.start_stage("final", input_ids=_ids(merged))
             merged = merged[:top_k]
+            if trace is not None:
+                trace.end_stage(_ids(merged), _scores(merged))
+                trace.finalize(query, "hybrid")
+                self._stats.record_query(trace, source=getattr(trace, "_source", "unknown"))
 
             # Bump access counts async
             if merged:
@@ -946,6 +1636,12 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return merged
         except Exception as e:
             logger.debug("LanceDB search failed: %s", e)
+            if trace is not None:
+                try:
+                    trace.finalize(query, "hybrid")
+                    self._stats.record_query(trace, source=getattr(trace, "_source", "error"))
+                except Exception:
+                    pass
             return []
 
     def _bump_access(self, ids: List[str]) -> None:
@@ -977,17 +1673,40 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return None
         try:
             vec = self._embedder.embed(text)
-            results = (
-                self._table.search(vec, vector_column_name="vector")
-                .where(f"user_id = '{self._user_id}'", prefilter=True)
-                .limit(1)
-                .to_list()
-            )
+            where_clause = self._build_scope_where()
+            search = self._table.search(vec, vector_column_name="vector")
+            if where_clause:
+                search = search.where(where_clause, prefilter=True)
+            results = search.limit(1).to_list()
             if results and results[0].get("_distance", 999) < threshold:
                 return results[0]
         except Exception:
             pass
         return None
+
+    def _is_vector_noise(self, vec: List[float]) -> bool:
+        """Vector-level noise check via the prototype bank (P2)."""
+        if not self._noise_proto or not self._noise_proto.initialized:
+            return False
+        try:
+            return self._noise_proto.is_noise(vec, threshold=_NOISE_PROTO_THRESHOLD)
+        except Exception:
+            return False
+
+    def _should_admit(self, text: str, vec: List[float], category: str) -> Tuple[bool, str]:
+        """Combined admission check: regex noise OR vector noise OR admission gate.
+
+        Returns (admit, reason). Reason is empty when admitted.
+        """
+        if _is_noise(text):
+            return False, "regex noise filter"
+        if vec and self._is_vector_noise(vec):
+            return False, "noise prototype match"
+        if self._admission and self._admission.enabled:
+            decision = self._admission.evaluate(text, vec, category=category)
+            if not decision.admit:
+                return False, f"admission control: {decision.reason}"
+        return True, ""
 
     def _write_entries(self, entries: List[Dict]) -> None:
         if not self._ready or not entries or self._table is None or self._embedder is None:
@@ -998,24 +1717,120 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 text = entry.get("content", "")
                 if not text.strip():
                     continue
-                rows.append({
-                    "id": str(uuid.uuid4()),
-                    "content": text,
-                    "vector": self._embedder.embed(text),
-                    "timestamp": entry.get("timestamp", time.time()),
-                    "source": entry.get("source", "turn"),
-                    "session_id": entry.get("session_id", self._session_id),
-                    "user_id": entry.get("user_id", self._user_id),
-                    "tags": json.dumps(entry.get("tags", [])),
-                    "tier": entry.get("tier", "peripheral"),
-                    "importance": float(entry.get("importance", 0.5)),
-                    "access_count": int(entry.get("access_count", 0)),
-                    "category": entry.get("category", "general"),
-                    "abstract": entry.get("abstract", ""),
-                    "overview": entry.get("overview", ""),
-                })
+
+                # P4: compute temporal_type once per entry (shared across chunks).
+                temporal = entry.get("temporal_type")
+                if not temporal:
+                    try:
+                        temporal = _temporal.classify_temporal(text, llm=self._llm)
+                    except Exception:
+                        temporal = "static"
+                temporal_str = str(temporal or "static")
+
+                # P2: chunk long content. Each chunk shares a parent_id.
+                pieces: List[Tuple[str, str]] = []
+                if len(text) > _CHUNK_TRIGGER_CHARS:
+                    chunks = chunk_text(text, _CHUNK_MAX_CHARS, _CHUNK_OVERLAP)
+                    parent_id = str(uuid.uuid4())
+                    for chunk in chunks:
+                        pieces.append((chunk, parent_id))
+                else:
+                    pieces.append((text, entry.get("parent_id", "")))
+
+                category = entry.get("category", "general")
+                source = entry.get("source", "turn")
+                base_metadata_obj = entry.get("metadata")
+                if isinstance(base_metadata_obj, dict):
+                    base_metadata_str = stringify_smart_metadata(base_metadata_obj)
+                elif isinstance(base_metadata_obj, str):
+                    base_metadata_str = base_metadata_obj
+                else:
+                    base_metadata_str = ""
+
+                for chunk_text_value, parent_id in pieces:
+                    vec = self._embedder.embed(chunk_text_value)
+
+                    # P2: gate via combined noise + admission check (skipped for
+                    # explicit `lancedb_remember` writes — those are user intent).
+                    if source not in ("explicit",):
+                        admit, reason = self._should_admit(chunk_text_value, vec, category)
+                        if not admit:
+                            logger.debug("LanceDB write skipped: %s", reason)
+                            continue
+
+                    # P2: smart metadata. If caller supplied one we keep it,
+                    # otherwise extract on the fly when LLM is wired up.
+                    metadata_str = base_metadata_str
+                    if (
+                        not metadata_str
+                        and self._smart_metadata_enabled
+                        and self._llm is not None
+                    ):
+                        try:
+                            meta = extract_smart_metadata(
+                                chunk_text_value,
+                                self._llm,
+                                abstract=entry.get("abstract", ""),
+                                category=category,
+                                source="manual" if source == "explicit" else "auto-capture",
+                                timestamp=entry.get("timestamp", time.time()),
+                            )
+                            metadata_str = stringify_smart_metadata(meta)
+                        except Exception as e:
+                            logger.debug("smart metadata extraction failed: %s", e)
+                            metadata_str = ""
+
+                    row = {
+                        "id": str(uuid.uuid4()),
+                        "content": chunk_text_value,
+                        "vector": vec,
+                        "timestamp": entry.get("timestamp", time.time()),
+                        "source": source,
+                        "session_id": entry.get("session_id", self._session_id),
+                        "user_id": entry.get("user_id", self._user_id),
+                        "tags": json.dumps(entry.get("tags", [])),
+                        "tier": entry.get("tier", "peripheral"),
+                        "importance": float(entry.get("importance", 0.5)),
+                        "access_count": int(entry.get("access_count", 0)),
+                        "category": category,
+                        "abstract": entry.get("abstract", ""),
+                        "overview": entry.get("overview", ""),
+                        "metadata": metadata_str,
+                        "parent_id": parent_id,
+                        "temporal_type": temporal_str,
+                    }
+                    # P1 — populate scope columns when present.
+                    if self._has_scope_columns:
+                        row["agent_id"] = entry.get("agent_id", self._agent_id) or ""
+                        row["project_id"] = entry.get("project_id", self._project_id) or ""
+                        row["team_id"] = entry.get("team_id", self._team_id) or ""
+                        row["workspace_id"] = entry.get("workspace_id", self._workspace_id) or ""
+                        canonical = entry.get("scope")
+                        if not canonical:
+                            if row["agent_id"]:
+                                canonical = f"agent:{row['agent_id']}"
+                            elif row["user_id"]:
+                                canonical = f"user:{row['user_id']}"
+                            else:
+                                canonical = GLOBAL_SCOPE
+                        row["scope"] = canonical
+                    rows.append(row)
             if rows:
-                self._table.add(rows)
+                # P5: cross-process file lock so multiple Hermes instances don't
+                # corrupt the table when writing concurrently.
+                table_path = os.path.join(self._storage_path or "", _TABLE_NAME)
+                with _with_lock(table_path):
+                    self._table.add(rows)
+                # P4: nudge the compactor — it has its own counter + cooldown.
+                try:
+                    for _ in rows:
+                        self._compactor_trigger.bump(
+                            self,
+                            user_id=self._user_id,
+                            session_id=self._session_id,
+                        )
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug("Compactor trigger bump failed: %s", e)
         except Exception as e:
             logger.warning("LanceDB write failed: %s", e)
 
@@ -1046,47 +1861,69 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 }])
             return
 
-        for candidate in candidates:
+        # P2: build an existing-pool from a single vector probe per candidate,
+        # then run ONE batch dedup LLM call instead of N pairwise calls.
+        existing_pool: List[Dict] = []
+        candidate_to_match: Dict[int, Dict] = {}
+        for idx, candidate in enumerate(candidates):
+            content = candidate.get("content", "")
+            if not content.strip():
+                continue
+            similar = self._find_similar(content)
+            if similar:
+                candidate_to_match[idx] = similar
+                # Add to pool if not already present
+                if not any(p.get("id") == similar.get("id") for p in existing_pool):
+                    existing_pool.append(similar)
+                if len(existing_pool) >= _BATCH_DEDUP_POOL_SIZE:
+                    break
+
+        embed_fn = self._embedder.embed if self._embedder else None
+        decisions = batch_dedup(
+            candidates,
+            existing_pool,
+            self._llm,
+            embedder=embed_fn,
+        )
+        decisions_by_index = {d["index"]: d for d in decisions}
+
+        for idx, candidate in enumerate(candidates):
             content = candidate.get("content", "")
             if not content.strip():
                 continue
 
-            similar = self._find_similar(content)
+            d = decisions_by_index.get(idx, {"decision": "create", "merged_content": ""})
+            decision = d.get("decision", "create")
+            merged = d.get("merged_content") or ""
+            similar = candidate_to_match.get(idx)
 
-            if similar:
-                decision, merged = _llm_dedup(
-                    similar.get("content", ""),
-                    content,
-                    self._llm,
-                )
+            if decision in ("skip", "support"):
+                continue
 
-                if decision in ("skip", "support"):
-                    continue
+            if decision == "supersede" and similar and similar.get("id"):
+                try:
+                    self._table.delete(f"id = '{similar['id']}'")
+                except Exception:
+                    pass
+                self._write_entries([{**candidate, "source": "extraction", "timestamp": time.time(),
+                                      "session_id": turn_data.get("session_id", self._session_id)}])
+                continue
 
-                if decision == "supersede" and similar.get("id"):
+            if decision == "merge" and merged and similar:
+                if similar.get("id"):
                     try:
                         self._table.delete(f"id = '{similar['id']}'")
                     except Exception:
                         pass
-                    self._write_entries([{**candidate, "source": "extraction", "timestamp": time.time(),
-                                          "session_id": turn_data.get("session_id", self._session_id)}])
-                    continue
+                candidate["content"] = merged
+                candidate["abstract"] = candidate.get("abstract", merged[:80])
+                self._write_entries([{**candidate, "source": "extraction_merge", "timestamp": time.time(),
+                                      "session_id": turn_data.get("session_id", self._session_id)}])
+                continue
 
-                if decision == "merge" and merged:
-                    if similar.get("id"):
-                        try:
-                            self._table.delete(f"id = '{similar['id']}'")
-                        except Exception:
-                            pass
-                    candidate["content"] = merged
-                    candidate["abstract"] = candidate.get("abstract", merged[:80])
-                    self._write_entries([{**candidate, "source": "extraction_merge", "timestamp": time.time(),
-                                          "session_id": turn_data.get("session_id", self._session_id)}])
-                    continue
-
-                if decision == "contradict":
-                    # Store with a conflict marker
-                    candidate["abstract"] = f"[CONFLICT] {candidate.get('abstract', '')}"
+            if decision == "contradict":
+                # Store with a conflict marker
+                candidate["abstract"] = f"[CONFLICT] {candidate.get('abstract', '')}"
 
             self._write_entries([{**candidate, "source": "extraction", "timestamp": time.time(),
                                    "session_id": turn_data.get("session_id", self._session_id)}])
@@ -1130,6 +1967,8 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return
 
         def _run():
+            # P4: dual write — LLM extraction AND a compressed session summary
+            # so recovery can re-inflate full context for the same session_id.
             try:
                 prompt = _build_session_extraction_prompt(messages)
                 candidates = _llm_extract_memories(prompt, self._llm)
@@ -1141,6 +1980,23 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     self._write_entries(entries)
             except Exception as e:
                 logger.debug("Session-end extraction failed: %s", e)
+            try:
+                summary = _sessions.compress_session(
+                    messages,
+                    llm=self._llm,
+                    session_id=self._session_id,
+                    user_id=self._user_id,
+                )
+                if summary:
+                    self._write_entries([summary])
+            except Exception as e:
+                logger.debug("Session-end compression failed: %s", e)
+
+            # P3: capture a reflection alongside the regular extraction.
+            try:
+                self._capture_reflection_at_session_end(messages)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Reflection capture (session-end) failed: %s", e)
 
         threading.Thread(target=_run, daemon=True, name="lancedb-session-end").start()
 
@@ -1226,6 +2082,66 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 "description": "Show memory statistics: total count, tier breakdown, category breakdown.",
                 "parameters": {"type": "object", "properties": {}},
             },
+            {
+                "name": "lancedb_reflect",
+                "description": (
+                    "Explicitly write a reflection (markdown with ## Invariants / ## Derived / "
+                    "## Lessons sections) to the dedicated reflection store. Use when you have "
+                    "a session-summary insight worth persisting separately from regular memory."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reflection_text": {
+                            "type": "string",
+                            "description": "Markdown reflection in the canonical format.",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Scope tag (default 'global').",
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "Command/event name (default 'manual').",
+                        },
+                    },
+                    "required": ["reflection_text"],
+                },
+            },
+            {
+                "name": "lancedb_reflections",
+                "description": (
+                    "Search ONLY the reflection store (separate from regular memories). "
+                    "Returns invariants, derived deltas, lessons, and decisions tagged with the "
+                    "originating session/event."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What to search for."},
+                        "top_k": {"type": "integer", "description": "Max results (default 6, max 20)."},
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "lancedb_compact",
+                "description": (
+                    "Run a memory compaction pass. Clusters near-duplicate entries by "
+                    "cosine similarity and merges each cluster into one denser entry. "
+                    "Runs automatically every N writes; call this when you want to force a pass."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "min_age_days": {"type": "number", "description": "Only compact memories at least this many days old (default 7)."},
+                        "similarity_threshold": {"type": "number", "description": "Cosine threshold for clustering (default 0.88)."},
+                        "min_cluster_size": {"type": "integer", "description": "Min memories in a cluster (default 2)."},
+                        "max_memories_to_scan": {"type": "integer", "description": "Cap on rows scanned (default 200)."},
+                        "dry_run": {"type": "boolean", "description": "Report plan without making changes."},
+                    },
+                },
+            },
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -1290,16 +2206,38 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                         return json.dumps({"error": str(e)})
             return json.dumps({"error": "provide query or id"})
 
+        if tool_name == "lancedb_compact":
+            if not self._ready or self._table is None:
+                return json.dumps({"error": "memory not ready"})
+            cfg = _compactor.CompactionConfig(
+                min_age_days=float(args.get("min_age_days", 7.0)),
+                similarity_threshold=float(args.get("similarity_threshold", 0.88)),
+                min_cluster_size=int(args.get("min_cluster_size", 2)),
+                max_memories_to_scan=int(args.get("max_memories_to_scan", 200)),
+                dry_run=bool(args.get("dry_run", False)),
+            )
+            try:
+                result = _compactor.compact_memories(
+                    self,
+                    llm=self._llm,
+                    config=cfg,
+                    session_id=self._session_id,
+                    user_id=self._user_id,
+                    max_iterations=int(args.get("max_iterations", 1)),
+                )
+                return json.dumps(result.to_dict())
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
         if tool_name == "lancedb_stats":
             if not self._ready or self._table is None:
                 return json.dumps({"error": "memory not ready"})
             try:
-                rows = (
-                    self._table.search()
-                    .where(f"user_id = '{self._user_id}'", prefilter=True)
-                    .limit(10000)
-                    .to_list()
-                )
+                where_clause = self._build_scope_where()
+                search = self._table.search()
+                if where_clause:
+                    search = search.where(where_clause, prefilter=True)
+                rows = search.limit(10000).to_list()
                 total = len(rows)
                 tiers: Dict[str, int] = {}
                 cats: Dict[str, int] = {}
@@ -1317,6 +2255,71 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             except Exception as e:
                 return json.dumps({"error": str(e)})
 
+        if tool_name == "lancedb_reflect":
+            text = (args.get("reflection_text") or "").strip()
+            if not text:
+                return json.dumps({"error": "reflection_text is required"})
+            if self._reflection_store is None or not self._reflection_store.is_ready:
+                return json.dumps({
+                    "error": "reflection store not enabled",
+                    "hint": "set LANCEDB_REFLECTION_ENABLED=1 and re-initialize",
+                })
+            params = BuildReflectionStorePayloadsParams(
+                reflection_text=text,
+                session_key=self._session_id or "session",
+                session_id=self._session_id or "session",
+                agent_id=self._user_id,
+                command=args.get("command", "manual"),
+                scope=args.get("scope", "global"),
+                tool_error_signals=[],
+                run_at=time.time() * 1000.0,
+                used_fallback=False,
+            )
+            try:
+                result = self._reflection_store.write_reflection(params)
+                return json.dumps({
+                    "stored": result.get("stored", False),
+                    "event_id": result.get("event_id", ""),
+                    "stored_kinds": result.get("stored_kinds", []),
+                    "ids": result.get("ids", []),
+                })
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+        if tool_name == "lancedb_reflections":
+            if self._reflection_store is None or not self._reflection_store.is_ready:
+                return json.dumps({
+                    "error": "reflection store not enabled",
+                    "hint": "set LANCEDB_REFLECTION_ENABLED=1 and re-initialize",
+                })
+            query = (args.get("query") or "").strip()
+            if not query:
+                return json.dumps({"error": "query is required"})
+            try:
+                top_k = min(int(args.get("top_k", 6)), 20)
+            except (TypeError, ValueError):
+                top_k = 6
+            try:
+                hits = self._reflection_store.search(query, top_k=top_k)
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+            return json.dumps({
+                "results": [
+                    {
+                        "id": h.id,
+                        "text": h.text[:500],
+                        "kind": h.kind,
+                        "scope": h.scope,
+                        "score": round(float(h.score), 4),
+                        "importance": round(float(h.importance), 2),
+                        "event_id": h.event_id,
+                        "session_id": h.session_id,
+                        "age_days": round(_age_days(h.timestamp / 1000.0 if h.timestamp > 1e10 else h.timestamp), 1),
+                    }
+                    for h in hits
+                ],
+            })
+
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
     def shutdown(self) -> None:
@@ -1326,4 +2329,45 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         logger.info("LanceDB memory shut down.")
 
 
-__all__ = ["LanceDBMemoryProvider"]
+__all__ = [
+    "LanceDBMemoryProvider",
+    "MEMORY_CATEGORIES",
+    # P1 re-exports for downstream consumers and tests
+    "Embedder",
+    "EmbeddingError",
+    "ScopeManager",
+    "make_embedder",
+    "get_provider_from_env",
+    "is_provider_available",
+    "EMBEDDING_DIMENSIONS",
+    "PROVIDER_DEFAULT_MODEL",
+    "GLOBAL_SCOPE",
+    "SCOPE_COLUMNS",
+    "SCOPE_COLUMN_DEFAULTS",
+    "parse_agent_id_from_session_key",
+    "clawteam_scopes_from_env",
+    # P2 modules re-exported for convenience
+    "AdmissionController",
+    "NoisePrototypeFilter",
+    "batch_dedup",
+    "chunk_text",
+    "extract_smart_metadata",
+    "stringify_smart_metadata",
+    # Reflection subsystem (P3) — re-exported for convenient top-level access.
+    "ReflectionStore",
+    "ReflectionEventStore",
+    "ReflectionItemStore",
+    "ReflectionRanker",
+    "BuildReflectionStorePayloadsParams",
+    "ReflectionErrorSignalLike",
+    # P4 submodules — re-exported for explicit imports.
+    "_lifecycle",
+    "_temporal",
+    "_sessions",
+    "_compactor",
+    "_auto_capture",
+    "_query",
+    # P5 observability re-exports
+    "RetrievalStats",
+    "RetrievalTrace",
+]
