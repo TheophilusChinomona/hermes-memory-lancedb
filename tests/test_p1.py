@@ -591,6 +591,8 @@ class TestSchemaMigrationAddsScopeColumns(unittest.TestCase):
             "agent_id", "project_id", "team_id", "workspace_id", "scope",
             # P2 columns also present
             "metadata", "parent_id",
+            # P4 column also present
+            "temporal_type",
         ]
         provider, table, added = self._make_provider_with_fake_table(all_cols)
         provider._migrate_schema_if_needed()

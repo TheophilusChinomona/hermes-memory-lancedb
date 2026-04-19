@@ -929,12 +929,13 @@ def _make_provider_no_init() -> LanceDBMemoryProvider:
 
 
 class TestProviderWiring(unittest.TestCase):
-    def test_provider_exposes_six_tools(self):
+    def test_provider_exposes_reflection_tools(self):
         p = LanceDBMemoryProvider()
         names = [s["name"] for s in p.get_tool_schemas()]
         self.assertIn("lancedb_reflect", names)
         self.assertIn("lancedb_reflections", names)
-        self.assertEqual(len(names), 6)
+        # Total count tracked by the merged-build top-level test in
+        # test_combined_tools.py; here we only assert the P3-specific tools land.
 
     def test_lancedb_reflect_requires_store(self):
         p = LanceDBMemoryProvider()

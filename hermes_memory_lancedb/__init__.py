@@ -1,6 +1,16 @@
-"""hermes-memory-lancedb v1.5.0 — LanceDB vector memory plugin for Hermes agents.
+"""hermes-memory-lancedb v1.6.0 — LanceDB vector memory plugin for Hermes agents.
 
 Hybrid BM25 + vector recall, Weibull decay, multi-provider embeddings.
+
+v1.6.0 additions (P4 of memory-lancedb-pro port — lifecycle and ops):
+  - lifecycle.py: TierManager + DecayEngine extracted from inline tier_evaluate
+  - temporal.py: static vs dynamic classifier; dynamic memories decay 3x faster
+  - sessions.py: end-of-session compression + recovery on reopen
+  - compactor.py: periodic cluster-merge of near-duplicate memories
+  - auto_capture.py: cleanup pass for the previous session's auto-captures
+  - query.py: intent analyzer + query expansion (BM25 fan-out across synonyms)
+  - New tool: lancedb_compact (also auto-runs every LANCEDB_COMPACT_EVERY_N writes)
+  - New schema column: temporal_type
 
 v1.5.0 additions (P3 of memory-lancedb-pro port — reflection subsystem):
   - Reflection store: separate `reflections` LanceDB table with own schema + FTS index
@@ -54,7 +64,22 @@ v1.5.0 additions (P3 of memory-lancedb-pro port — reflection subsystem):
   - _hybrid_search optionally pulls top-K reflections (env-tunable).
   - New tools: lancedb_reflect (explicit write), lancedb_reflections (search).
 
-v1.2.0 additions (P0 of memory-lancedb-pro port — retrieval quality):
+v1.6.0 additions (P4 of memory-lancedb-pro port — lifecycle & ops):
+  - Tier manager + decay engine extracted into ``lifecycle`` module with
+    importance-modulated half-life and ``apply_search_boost``
+  - Temporal classifier (``static`` vs ``dynamic``); dynamic memories
+    decay 3x faster (``temporal`` module + new schema column)
+  - Session compressor + recovery: end-of-session summary + start-of-session
+    re-inflation (``sessions`` module)
+  - Memory compactor: cluster-and-merge near-duplicates; new
+    ``lancedb_compact`` tool + auto-trigger every N writes
+    (``LANCEDB_COMPACT_EVERY_N`` env var)
+  - Auto-capture cleanup: scrubs previous session's noisy auto-captures at
+    session start (``auto_capture`` module)
+  - Intent analyzer + query expander: pre-search rules expand short queries
+    with synonyms and route to category boosts (``query`` module)
+
+v1.2.0 additions (P0 — retrieval quality):
   - Cross-encoder reranking via Jina (fallback: cosine of query vs doc vectors)
   - MMR diversity: defer near-duplicate hits (cosine > 0.85) to end
   - Length normalization: log2 penalty for entries longer than 500 chars
@@ -127,6 +152,14 @@ from .admission import AdmissionController  # noqa: E402
 from .smart_metadata import extract_smart_metadata, stringify_smart_metadata  # noqa: E402
 from .noise_proto import NoisePrototypeFilter  # noqa: E402
 
+# v1.6.0 (P4) submodules — lifecycle, temporal, sessions, compactor, auto-capture, query.
+from . import lifecycle as _lifecycle  # noqa: E402
+from . import temporal as _temporal  # noqa: E402
+from . import sessions as _sessions  # noqa: E402
+from . import compactor as _compactor  # noqa: E402
+from . import auto_capture as _auto_capture  # noqa: E402
+from . import query as _query  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # MemoryProvider base
 # ---------------------------------------------------------------------------
@@ -176,6 +209,10 @@ _RRF_K = 60
 _WEIBULL_SCALE = 30.0
 _WEIBULL_SHAPE = 0.7
 _DECAY_THRESHOLD = 0.05
+# Dynamic memories decay this many times faster than static (see temporal classifier).
+_DYNAMIC_DECAY_MULTIPLIER = 3.0
+# Default auto-trigger threshold for the memory compactor (writes between runs).
+_DEFAULT_COMPACT_EVERY_N = 100
 
 # v1.2.0 retrieval pipeline tuning
 _LENGTH_NORM_ANCHOR = 500
@@ -248,6 +285,8 @@ def _get_schema(embed_dim: int = _EMBED_DIM):
         # v1.4.0 P2 fields
         pa.field("metadata", pa.string()),   # JSON-encoded smart metadata
         pa.field("parent_id", pa.string()),  # links chunked rows to their source
+        # v1.6.0 P4 fields
+        pa.field("temporal_type", pa.string()),  # "static" or "dynamic"
     ])
 
 
@@ -453,26 +492,20 @@ def _tier_evaluate(
     decay_weight: float,
     age_days: float,
 ) -> Optional[str]:
-    """Return new tier if promotion/demotion warranted, else None."""
-    composite = _composite_score(decay_weight, importance)
+    """Backwards-compat wrapper around :class:`lifecycle.TierManager`.
 
-    if current_tier == "peripheral":
-        if access_count >= _PROMO_PERI_TO_WORK_ACCESS and composite >= _PROMO_PERI_TO_WORK_COMPOSITE:
-            return "working"
-
-    elif current_tier == "working":
-        if (access_count >= _PROMO_WORK_TO_CORE_ACCESS
-                and composite >= _PROMO_WORK_TO_CORE_COMPOSITE
-                and importance >= _PROMO_WORK_TO_CORE_IMPORTANCE):
-            return "core"
-        if composite < _DEMO_COMPOSITE_THRESHOLD or (age_days > _DEMO_AGE_DAYS and access_count < _DEMO_AGE_ACCESS_THRESHOLD):
-            return "peripheral"
-
-    elif current_tier == "core":
-        if composite < _DEMO_COMPOSITE_THRESHOLD and access_count < _DEMO_AGE_ACCESS_THRESHOLD:
-            return "working"
-
-    return None
+    Returns the new tier if a promotion/demotion is warranted, else ``None``.
+    The v1.1.0 inline implementation lived here; v1.6.0 (P4) extracts the
+    real logic into :mod:`hermes_memory_lancedb.lifecycle` so this function
+    is now a thin shim.
+    """
+    return _lifecycle.tier_evaluate_legacy(
+        current_tier=current_tier,
+        access_count=access_count,
+        importance=importance,
+        decay_weight=decay_weight,
+        age_days=age_days,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +898,15 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._reflection_item_store: ReflectionItemStore = ReflectionItemStore()
         self._reflection_ranker: ReflectionRanker = ReflectionRanker()
 
+        # P4: memory compactor auto-trigger
+        try:
+            every_n = int(os.environ.get("LANCEDB_COMPACT_EVERY_N", str(_DEFAULT_COMPACT_EVERY_N)))
+        except (TypeError, ValueError):
+            every_n = _DEFAULT_COMPACT_EVERY_N
+        self._compactor_trigger = _compactor.CompactionTrigger(every_n=every_n)
+        # P4: recovered-context block exposed via system_prompt_block().
+        self._recovered_context = ""
+
     @property
     def name(self) -> str:
         return "lancedb"
@@ -994,7 +1036,7 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
 
             self._ready = True
             logger.info(
-                "LanceDB memory v1.5.0 initialized at %s (provider=%s, dim=%d)",
+                "LanceDB memory v1.6.0 initialized at %s (provider=%s, dim=%d)",
                 self._storage_path,
                 get_provider_from_env(),
                 self._embed_dim,
@@ -1005,6 +1047,24 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             # if absent, the reflection store falls back to FTS-only.
             if os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1":
                 self._init_reflection_store()
+
+            # P4: auto-capture cleanup for the previous session's noise + session
+            # recovery for re-opened sessions. Both run in the background to keep
+            # initialize() snappy.
+            previous_session_id = kwargs.get("previous_session_id") or ""
+            if previous_session_id:
+                threading.Thread(
+                    target=self._run_auto_capture_cleanup,
+                    args=(previous_session_id,),
+                    daemon=True,
+                    name="lancedb-cleanup",
+                ).start()
+            threading.Thread(
+                target=self._run_session_recovery,
+                args=(session_id,),
+                daemon=True,
+                name="lancedb-recovery",
+            ).start()
 
             self.queue_prefetch("current targets prospects contacts plans tasks decisions")
 
@@ -1124,6 +1184,41 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             })
         return out
 
+    def _run_auto_capture_cleanup(self, previous_session_id: str) -> None:
+        """Background hook: cleanup auto-captures from a previous session."""
+        try:
+            report = _auto_capture.cleanup_auto_captures(
+                session_id=previous_session_id,
+                store=self,
+                user_id=self._user_id,
+            )
+            logger.info(
+                "Auto-capture cleanup for session %s: scanned=%d deleted=%d demoted=%d cleaned=%d",
+                previous_session_id,
+                report.scanned,
+                report.deleted,
+                report.demoted,
+                report.cleaned,
+            )
+        except Exception as e:
+            logger.debug("Auto-capture cleanup failed: %s", e)
+
+    def _run_session_recovery(self, session_id: str) -> None:
+        """Background hook: pull compressed entries for the current session_id
+        and stash a formatted block for ``system_prompt_block`` to include."""
+        try:
+            entries = _sessions.recover_session(
+                session_id=session_id,
+                store=self,
+                user_id=self._user_id,
+            )
+            if entries:
+                self._recovered_context = _sessions.format_recovered(entries)
+                logger.info("Recovered %d compressed entries for session %s",
+                            len(entries), session_id)
+        except Exception as e:
+            logger.debug("Session recovery failed: %s", e)
+
     def _migrate_schema_if_needed(self) -> None:
         if self._table is None:
             return
@@ -1140,6 +1235,8 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 # v1.4.0 P2
                 "metadata": "''",
                 "parent_id": "''",
+                # v1.6.0 P4
+                "temporal_type": "'static'",
             }
             # v1.3.0 P1 — multi-scope columns
             scope_fields = dict(SCOPE_COLUMN_DEFAULTS)
@@ -1165,16 +1262,21 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
     def system_prompt_block(self) -> str:
         if not self._ready:
             return ""
-        return (
+        block = (
             "# LanceDB Memory\n"
-            "You have persistent vector memory across sessions (v1.1.0 — tiered, categorised). "
+            "You have persistent vector memory across sessions (v1.6.0 — tiered, "
+            "categorised, temporal-aware). "
             "Call lancedb_search before most responses — any question, task, or topic "
             "may have relevant context from previous sessions. "
             "Default to searching first, then answering. Only skip if the query is "
             "clearly self-contained (e.g. a simple calculation or format request). "
             "Do not fabricate from training knowledge when memory may have the answer. "
-            "Use lancedb_remember to store durable facts explicitly."
+            "Use lancedb_remember to store durable facts explicitly. "
+            "Use lancedb_compact periodically to merge near-duplicate entries."
         )
+        if self._recovered_context:
+            block += "\n\n" + self._recovered_context
+        return block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
@@ -1221,17 +1323,47 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             if where_clause:
                 v_search = v_search.where(where_clause, prefilter=True)
             v_results = v_search.limit(_TOP_K_VECTOR).to_list()
+
+            # P4: query expansion — fan out BM25 across original + synonym variants,
+            # de-duplicating by id while preserving the best rank per id. Falls
+            # back to the original query if expansion misbehaves.
             try:
-                b_search = self._table.search(query, query_type="fts")
-                if where_clause:
-                    b_search = b_search.where(where_clause, prefilter=True)
-                b_results = b_search.limit(_TOP_K_BM25).to_list()
+                expanded_queries = _query.expand_query(query, llm=self._llm)
+            except Exception:
+                expanded_queries = [query]
+            if not expanded_queries:
+                expanded_queries = [query]
+
+            b_results: List[Dict] = []
+            seen_ids: set = set()
+            try:
+                for q in expanded_queries[:3]:  # cap to avoid latency blow-up
+                    try:
+                        b_search = self._table.search(q, query_type="fts")
+                        if where_clause:
+                            b_search = b_search.where(where_clause, prefilter=True)
+                        rows = b_search.limit(_TOP_K_BM25).to_list()
+                    except Exception:
+                        continue
+                    for r in rows:
+                        rid = r.get("id")
+                        if rid and rid not in seen_ids:
+                            seen_ids.add(rid)
+                            b_results.append(r)
+                        if len(b_results) >= _TOP_K_BM25 * 2:
+                            break
+                    if len(b_results) >= _TOP_K_BM25 * 2:
+                        break
             except Exception:
                 b_results = []
 
             def _hit(row) -> Optional[Dict]:
                 ts = row.get("timestamp", 0.0) or 0.0
-                base_decay = _weibull_weight(_age_days(ts))
+                age_d = _age_days(ts)
+                temporal = (row.get("temporal_type") or "").lower() or None
+                # Dynamic memories decay 3x faster: scale the effective age.
+                effective_age = age_d * _DYNAMIC_DECAY_MULTIPLIER if temporal == "dynamic" else age_d
+                base_decay = _weibull_weight(effective_age)
                 tier = row.get("tier") or "peripheral"
                 floor = _TIER_DECAY_FLOOR.get(tier, 0.0)
                 w = max(base_decay, floor)
@@ -1249,6 +1381,7 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     "access_count": row.get("access_count", 0),
                     "importance": row.get("importance", 0.5),
                     "vector": row.get("vector"),
+                    "temporal_type": temporal or "static",
                 }
 
             v_hits = [h for r in v_results if (h := _hit(r))]
@@ -1260,6 +1393,14 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             merged = _merge_rrf(v_hits, b_hits, top_k=rerank_window)
             if not merged:
                 return []
+
+            # Stage 1b (P4): intent-based category boost. Cheap rule-based
+            # classification; LLM is only consulted if rules return "broad".
+            try:
+                intent = _query.analyze_intent(query, llm=None)  # rule-only for speed
+                merged = _query.apply_category_boost(merged, intent)
+            except Exception:
+                pass
 
             # Stage 2: Normalize RRF scores to [0, 1] so subsequent thresholds
             # (min-score, hard-min-score) operate on a meaningful scale.
@@ -1421,6 +1562,15 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 if not text.strip():
                     continue
 
+                # P4: compute temporal_type once per entry (shared across chunks).
+                temporal = entry.get("temporal_type")
+                if not temporal:
+                    try:
+                        temporal = _temporal.classify_temporal(text, llm=self._llm)
+                    except Exception:
+                        temporal = "static"
+                temporal_str = str(temporal or "static")
+
                 # P2: chunk long content. Each chunk shares a parent_id.
                 pieces: List[Tuple[str, str]] = []
                 if len(text) > _CHUNK_TRIGGER_CHARS:
@@ -1491,6 +1641,7 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                         "overview": entry.get("overview", ""),
                         "metadata": metadata_str,
                         "parent_id": parent_id,
+                        "temporal_type": temporal_str,
                     }
                     # P1 — populate scope columns when present.
                     if self._has_scope_columns:
@@ -1510,6 +1661,16 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     rows.append(row)
             if rows:
                 self._table.add(rows)
+                # P4: nudge the compactor — it has its own counter + cooldown.
+                try:
+                    for _ in rows:
+                        self._compactor_trigger.bump(
+                            self,
+                            user_id=self._user_id,
+                            session_id=self._session_id,
+                        )
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug("Compactor trigger bump failed: %s", e)
         except Exception as e:
             logger.warning("LanceDB write failed: %s", e)
 
@@ -1646,6 +1807,8 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             return
 
         def _run():
+            # P4: dual write — LLM extraction AND a compressed session summary
+            # so recovery can re-inflate full context for the same session_id.
             try:
                 prompt = _build_session_extraction_prompt(messages)
                 candidates = _llm_extract_memories(prompt, self._llm)
@@ -1657,6 +1820,17 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     self._write_entries(entries)
             except Exception as e:
                 logger.debug("Session-end extraction failed: %s", e)
+            try:
+                summary = _sessions.compress_session(
+                    messages,
+                    llm=self._llm,
+                    session_id=self._session_id,
+                    user_id=self._user_id,
+                )
+                if summary:
+                    self._write_entries([summary])
+            except Exception as e:
+                logger.debug("Session-end compression failed: %s", e)
 
             # P3: capture a reflection alongside the regular extraction.
             try:
@@ -1790,6 +1964,24 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     "required": ["query"],
                 },
             },
+            {
+                "name": "lancedb_compact",
+                "description": (
+                    "Run a memory compaction pass. Clusters near-duplicate entries by "
+                    "cosine similarity and merges each cluster into one denser entry. "
+                    "Runs automatically every N writes; call this when you want to force a pass."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "min_age_days": {"type": "number", "description": "Only compact memories at least this many days old (default 7)."},
+                        "similarity_threshold": {"type": "number", "description": "Cosine threshold for clustering (default 0.88)."},
+                        "min_cluster_size": {"type": "integer", "description": "Min memories in a cluster (default 2)."},
+                        "max_memories_to_scan": {"type": "integer", "description": "Cap on rows scanned (default 200)."},
+                        "dry_run": {"type": "boolean", "description": "Report plan without making changes."},
+                    },
+                },
+            },
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -1853,6 +2045,29 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                     except Exception as e:
                         return json.dumps({"error": str(e)})
             return json.dumps({"error": "provide query or id"})
+
+        if tool_name == "lancedb_compact":
+            if not self._ready or self._table is None:
+                return json.dumps({"error": "memory not ready"})
+            cfg = _compactor.CompactionConfig(
+                min_age_days=float(args.get("min_age_days", 7.0)),
+                similarity_threshold=float(args.get("similarity_threshold", 0.88)),
+                min_cluster_size=int(args.get("min_cluster_size", 2)),
+                max_memories_to_scan=int(args.get("max_memories_to_scan", 200)),
+                dry_run=bool(args.get("dry_run", False)),
+            )
+            try:
+                result = _compactor.compact_memories(
+                    self,
+                    llm=self._llm,
+                    config=cfg,
+                    session_id=self._session_id,
+                    user_id=self._user_id,
+                    max_iterations=int(args.get("max_iterations", 1)),
+                )
+                return json.dumps(result.to_dict())
+            except Exception as e:
+                return json.dumps({"error": str(e)})
 
         if tool_name == "lancedb_stats":
             if not self._ready or self._table is None:
@@ -1985,4 +2200,11 @@ __all__ = [
     "ReflectionRanker",
     "BuildReflectionStorePayloadsParams",
     "ReflectionErrorSignalLike",
+    # P4 submodules — re-exported for explicit imports.
+    "_lifecycle",
+    "_temporal",
+    "_sessions",
+    "_compactor",
+    "_auto_capture",
+    "_query",
 ]
