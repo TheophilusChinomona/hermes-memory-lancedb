@@ -1152,8 +1152,23 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             # P3: lazy-init the reflection store. Default off — set
             # LANCEDB_REFLECTION_ENABLED=1 to opt in. Embedder is optional;
             # if absent, the reflection store falls back to FTS-only.
-            if os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1":
+            #
+            # Skipped on the pgvector backend: ReflectionStore embeds its
+            # own LanceDB connection, which SIGILLs on hosts without AVX2.
+            # A PgvectorReflectionStore is a follow-up.
+            if (
+                os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1"
+                and self._backend_name != "pgvector"
+            ):
                 self._init_reflection_store()
+            elif (
+                os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1"
+                and self._backend_name == "pgvector"
+            ):
+                logger.info(
+                    "LANCEDB_REFLECTION_ENABLED=1 ignored on pgvector backend "
+                    "(ReflectionStore is LanceDB-only; pgvector port pending)"
+                )
 
             # P4: auto-capture cleanup for the previous session's noise + session
             # recovery for re-opened sessions. Both run in the background to keep
