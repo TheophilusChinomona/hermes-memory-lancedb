@@ -156,8 +156,45 @@ pytest tests/
 | P0 — Cross-encoder rerank, MMR, length norm, hard min-score | Done (v1.2.0) |
 | P1 — Multi-scope (agent/user/project/team/workspace), multi-provider embeddings (Jina/Gemini/Ollama) | Done (v1.3.0) |
 | P2 — Chunker, batch dedup, admission control, smart metadata, noise prototypes | Done (v1.4.0) |
-| P3 — Reflection subsystem (event store, item store, ranking, retry, slices) | Pending |
+| P3 — Reflection subsystem (event store, item store, ranking, retry, slices) | Done (v1.5.0) |
 | P4 — Session compactor, memory compactor, temporal classifier, auto-capture cleanup, query expansion | Pending |
 | P5 — Management CLI, retrieval observability, markdown import, A/B reembed | Pending |
+
+### P3 — Reflection subsystem (v1.5.0)
+
+Reflections are agent-generated meta-memories with their own LanceDB table (`reflections`) and FTS index. They live in `hermes_memory_lancedb.reflection` and expose `ReflectionStore`, `ReflectionEventStore`, `ReflectionItemStore`, and `ReflectionRanker`.
+
+Disabled by default — opt in with:
+
+```bash
+export LANCEDB_REFLECTION_ENABLED=1
+# Optional knobs:
+export LANCEDB_REFLECTION_TOP_K=3              # reflections merged into hybrid_search
+export LANCEDB_REFLECTION_SCOPE=global         # scope tag for new reflections
+export LANCEDB_REFLECTION_COMMAND=session_end  # command field on auto-captures
+```
+
+Two new agent tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `lancedb_reflect` | Explicit write of a reflection markdown blob (Invariants / Derived / Lessons / Decisions sections) |
+| `lancedb_reflections` | Search ONLY the reflection store (separate from `lancedb_search`) |
+
+The reflection markdown schema follows the TS port:
+
+```markdown
+## Invariants
+- Always confirm production deploys via the dashboard before declaring done.
+
+## Derived
+- Next run, retry the failing migration with `--no-stats` to bypass the lock.
+
+## Lessons & pitfalls (symptom / cause / fix / prevention)
+- Symptom: 503 on container start. Cause: missing env var. Fix: load via Infisical. Prevention: add a startup smoke test.
+
+## Decisions (durable)
+- Use Compose + Traefik instead of Swarm on single-server deploys.
+```
 
 OAuth is intentionally out of scope — `OPENAI_API_KEY` and (optionally) `JINA_API_KEY` are sufficient.
