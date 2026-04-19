@@ -11,7 +11,7 @@ Two top-level classes:
   ``working`` / ``core`` based on access count, composite score, importance,
   and age.
 
-The legacy module-level ``_tier_evaluate`` (defined in ``hermes_memory_lancedb.__init__``)
+The legacy module-level ``_tier_evaluate`` (defined in ``athena_memory.__init__``)
 is kept as a thin backwards-compat wrapper around ``TierManager.evaluate`` so v1.1.0
 callers continue to work unchanged.
 """

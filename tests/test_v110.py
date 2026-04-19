@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pyarrow as pa
 
-from hermes_memory_lancedb import (
+from athena_memory import (
     LanceDBMemoryProvider,
     MEMORY_CATEGORIES,
     _age_days,
@@ -36,8 +36,8 @@ def _make_provider(tmpdir: str) -> LanceDBMemoryProvider:
     """Create an initialized provider backed by a temp directory."""
     p = LanceDBMemoryProvider()
     with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "LANCEDB_PATH": tmpdir}):
-        with patch("hermes_memory_lancedb._EmbedClient") as MockEmbed, \
-             patch("hermes_memory_lancedb._LLMClient") as MockLLM:
+        with patch("athena_memory._EmbedClient") as MockEmbed, \
+             patch("athena_memory._LLMClient") as MockLLM:
             MockEmbed.return_value.embed = lambda text: [0.1] * 1536
             MockLLM.return_value.chat = lambda *a, **kw: "[]"
             p.initialize("test-session-1")
@@ -711,8 +711,8 @@ class TestSchemaMigration(unittest.TestCase):
         # Now initialize provider — should migrate
         p = LanceDBMemoryProvider()
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "LANCEDB_PATH": tmpdir}):
-            with patch("hermes_memory_lancedb._EmbedClient") as ME, \
-                 patch("hermes_memory_lancedb._LLMClient") as ML:
+            with patch("athena_memory._EmbedClient") as ME, \
+                 patch("athena_memory._LLMClient") as ML:
                 ME.return_value.embed = lambda t: [0.1] * 1536
                 ML.return_value.chat = lambda *a, **kw: "[]"
                 p.initialize("migrated-session")

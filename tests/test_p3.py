@@ -1,6 +1,6 @@
 """Unit tests for the P3 reflection subsystem.
 
-Covers all 8 modules in `hermes_memory_lancedb.reflection`:
+Covers all 8 modules in `athena_memory.reflection`:
     metadata, ranking, retry, slices, event_store, item_store,
     mapped_metadata, store
 
@@ -19,7 +19,7 @@ import unittest
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
-from hermes_memory_lancedb import (
+from athena_memory import (
     BuildReflectionStorePayloadsParams,
     LanceDBMemoryProvider,
     ReflectionErrorSignalLike,
@@ -28,7 +28,7 @@ from hermes_memory_lancedb import (
     ReflectionRanker,
     ReflectionStore,
 )
-from hermes_memory_lancedb.reflection import (
+from athena_memory.reflection import (
     DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
     DEFAULT_REFLECTION_MAPPED_MAX_AGE_MS,
     REFLECTION_DERIVED_DECAY_K,

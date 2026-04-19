@@ -11,7 +11,7 @@ import unittest
 from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch
 
-from hermes_memory_lancedb import lifecycle, temporal, sessions, compactor, auto_capture, query
+from athena_memory import lifecycle, temporal, sessions, compactor, auto_capture, query
 
 
 # ---------------------------------------------------------------------------

@@ -19,19 +19,19 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
-from hermes_memory_lancedb import (
+from athena_memory import (
     MEMORY_CATEGORIES,
     RetrievalStats,
     RetrievalTrace,
     _with_lock,
 )
-from hermes_memory_lancedb.cli import cli, _get_version
-from hermes_memory_lancedb.import_md import (
+from athena_memory.cli import cli, _get_version
+from athena_memory.import_md import (
     discover_files,
     parse_markdown_file,
     run_import_markdown,
 )
-from hermes_memory_lancedb.observability import StageResult, _bucket_size
+from athena_memory.observability import StageResult, _bucket_size
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +435,7 @@ class TestCLI(unittest.TestCase):
 
     def test_delete_bulk_requires_ids_or_filter(self):
         # Patch _make_provider so the command body never reaches LanceDB.
-        with patch("hermes_memory_lancedb.cli._make_provider") as mp:
+        with patch("athena_memory.cli._make_provider") as mp:
             mp.return_value = MagicMock()
             result = self.runner.invoke(cli, ["delete-bulk"])
         self.assertNotEqual(result.exit_code, 0)
@@ -474,7 +474,7 @@ class TestCLI(unittest.TestCase):
             {"id": "x1", "tier": "core", "category": "profile", "content": "Theo facts", "vector": [0.0]},
         ]
         fake._user_id = "u"
-        with patch("hermes_memory_lancedb.cli._make_provider", return_value=fake):
+        with patch("athena_memory.cli._make_provider", return_value=fake):
             result = self.runner.invoke(cli, ["list", "--limit", "5"])
         self.assertEqual(result.exit_code, 0)
         self.assertIn("x1", result.output)
@@ -488,7 +488,7 @@ class TestCLI(unittest.TestCase):
             {"id": "x1", "tier": "core", "category": "profile", "content": "txt", "vector": [0.1, 0.2]},
         ]
         fake._user_id = "u"
-        with patch("hermes_memory_lancedb.cli._make_provider", return_value=fake):
+        with patch("athena_memory.cli._make_provider", return_value=fake):
             result = self.runner.invoke(cli, ["list", "--json"])
         self.assertEqual(result.exit_code, 0)
         out = json.loads(result.output)
@@ -505,7 +505,7 @@ class TestCLI(unittest.TestCase):
         ]
         fake._user_id = "u"
         fake.storage_path = "/tmp/none"
-        with patch("hermes_memory_lancedb.cli._make_provider", return_value=fake):
+        with patch("athena_memory.cli._make_provider", return_value=fake):
             result = self.runner.invoke(cli, ["export", "--format", "jsonl"])
         self.assertEqual(result.exit_code, 0)
         lines = [ln for ln in result.output.strip().split("\n") if ln.strip()]
@@ -521,7 +521,7 @@ class TestCLI(unittest.TestCase):
             fake = MagicMock()
             fake._user_id = "u"
             fake._write_entries = MagicMock()
-            with patch("hermes_memory_lancedb.cli._make_provider", return_value=fake):
+            with patch("athena_memory.cli._make_provider", return_value=fake):
                 result = self.runner.invoke(cli, ["import", path, "--dry-run"])
             self.assertEqual(result.exit_code, 0)
             self.assertIn("DRY RUN", result.output)
@@ -537,7 +537,7 @@ class TestCLI(unittest.TestCase):
         try:
             fake = MagicMock()
             fake._user_id = "u"
-            with patch("hermes_memory_lancedb.cli._make_provider", return_value=fake):
+            with patch("athena_memory.cli._make_provider", return_value=fake):
                 result = self.runner.invoke(cli, ["import", path])
             self.assertEqual(result.exit_code, 0)
             self.assertIn("Imported 2", result.output)
@@ -551,7 +551,7 @@ class TestCLI(unittest.TestCase):
             (base / "MEMORY.md").write_text("# Profile\n- this is theo\n")
             fake = MagicMock()
             fake._user_id = "u"
-            with patch("hermes_memory_lancedb.cli._make_provider", return_value=fake):
+            with patch("athena_memory.cli._make_provider", return_value=fake):
                 result = self.runner.invoke(
                     cli,
                     ["import-markdown", "--base-dir", str(base)],
@@ -565,7 +565,7 @@ class TestCLI(unittest.TestCase):
         fake._hybrid_search.return_value = [
             {"id": "h1", "content": "result one", "tier": "working", "category": "profile"},
         ]
-        with patch("hermes_memory_lancedb.cli._make_provider", return_value=fake):
+        with patch("athena_memory.cli._make_provider", return_value=fake):
             result = self.runner.invoke(cli, ["search", "hello"])
         self.assertEqual(result.exit_code, 0)
         self.assertIn("h1", result.output)
@@ -578,7 +578,7 @@ class TestCLI(unittest.TestCase):
         fake = MagicMock()
         fake._user_id = "u"
         fake._hybrid_search.return_value = []
-        with patch("hermes_memory_lancedb.cli._make_provider", return_value=fake):
+        with patch("athena_memory.cli._make_provider", return_value=fake):
             result = self.runner.invoke(cli, ["search", "hello", "--trace"])
         self.assertEqual(result.exit_code, 0)
         # trace kwarg was passed and is a RetrievalTrace instance
@@ -601,7 +601,7 @@ class TestHybridSearchTraceWiring(unittest.TestCase):
     def test_hybrid_search_accepts_trace_param_without_init(self):
         # We can't easily run _hybrid_search without lancedb on this CPU,
         # but we can assert the function signature is correct.
-        from hermes_memory_lancedb import LanceDBMemoryProvider
+        from athena_memory import LanceDBMemoryProvider
         import inspect
         sig = inspect.signature(LanceDBMemoryProvider._hybrid_search)
         self.assertIn("trace", sig.parameters)

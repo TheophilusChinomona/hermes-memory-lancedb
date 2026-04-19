@@ -8,7 +8,7 @@ prints to stdout.
 Run via either of:
 
   hermes-memory-lancedb <command> [options]
-  python -m hermes_memory_lancedb.cli <command> [options]
+  python -m athena_memory.cli <command> [options]
 
 Commands:
 
@@ -48,7 +48,7 @@ from . import (
 )
 from .import_md import run_import_markdown
 
-logger = logging.getLogger("hermes_memory_lancedb.cli")
+logger = logging.getLogger("athena_memory.cli")
 
 # ---------------------------------------------------------------------------
 # Provider plumbing

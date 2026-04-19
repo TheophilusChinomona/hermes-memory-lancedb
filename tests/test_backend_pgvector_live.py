@@ -87,7 +87,7 @@ class TestPgvectorLive(unittest.TestCase):
         # at the module-level so initialize() picks it up.
         from unittest.mock import patch
 
-        import hermes_memory_lancedb as hl
+        import athena_memory as hl
 
         self._embedder_patch = patch.object(
             hl, "make_embedder", return_value=_StubEmbedder()

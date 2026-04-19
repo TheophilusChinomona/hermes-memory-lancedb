@@ -1,10 +1,10 @@
-# hermes-memory-lancedb
+# athena-memory
 
 Pluggable persistent memory for [Hermes Agent](https://github.com/TheophilusChinomona/hermes-agent) (Athena fork). Hybrid BM25 + vector recall, cross-encoder reranking, MMR diversity, three-tier lifecycle, multi-provider embeddings, multi-scope isolation, LLM smart extraction with dedup, management CLI, and per-query observability — over either **LanceDB** (default, embedded) or **Postgres + pgvector + pg_search** (server-side, runs on any CPU).
 
 Python port of [memory-lancedb-pro](https://github.com/TheophilusChinomona/memory-lancedb-pro) (TypeScript). Drop-in for the bundled `lancedb` plugin in Athena's `plugins/memory/lancedb/`.
 
-> **Heads up — name vs. scope:** the package is still named `hermes-memory-lancedb` for backwards compatibility, but as of v2.0.0 it's a multi-backend memory plugin. A rename is planned once both backends are battle-tested.
+> **Renamed in v3.0.0:** the package was previously `hermes-memory-lancedb` and the GitHub repo was at `TheophilusChinomona/hermes-memory-lancedb`. Both old names redirect; `import hermes_memory_lancedb` still works (with a `DeprecationWarning`) until a future major version.
 
 ## Features
 
@@ -16,7 +16,7 @@ Python port of [memory-lancedb-pro](https://github.com/TheophilusChinomona/memor
 - Pgvector backend uses `pg_search` BM25 (tantivy under the hood — same engine LanceDB's FTS uses) when available, falls back to `tsvector` + `ts_rank_cd` on vanilla pgvector
 
 **Management & observability (v1.7.0 — P5)**
-- Console CLI: `hermes-memory-lancedb {list,search,stats,delete,delete-bulk,export,import,import-markdown,reembed,migrate,reindex-fts,version}`
+- Console CLI: `athena-memory {list,search,stats,delete,delete-bulk,export,import,import-markdown,reembed,migrate,reindex-fts,version}` (the old `hermes-memory-lancedb` script name still works as an alias)
 - Per-query `RetrievalTrace` records timings, score ranges, and dropped IDs at every pipeline stage
 - Rolling `RetrievalStats` ring buffer aggregates queries-by-source, p95 latency, top drop stages, and result-count histograms
 - Markdown ingest for `MEMORY.md` and dated `memory/YYYY-MM-DD.md` files
@@ -73,16 +73,18 @@ Not on PyPI. Install from git, picking the backend extras you want:
 
 ```bash
 # LanceDB backend (default, requires host CPU with AVX2 — Intel ≥ Haswell 2013, AMD ≥ Excavator 2015)
-pip install "hermes-memory-lancedb[lancedb] @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@main"
+pip install "athena-memory[lancedb] @ git+https://github.com/TheophilusChinomona/athena-memory@main"
 
 # Postgres + pgvector backend (any CPU; needs a Postgres server with the vector extension — ParadeDB image strongly recommended for pg_search BM25)
-pip install "hermes-memory-lancedb[pgvector] @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@main"
+pip install "athena-memory[pgvector] @ git+https://github.com/TheophilusChinomona/athena-memory@main"
 
 # Both
-pip install "hermes-memory-lancedb[lancedb,pgvector] @ git+https://github.com/TheophilusChinomona/hermes-memory-lancedb@main"
+pip install "athena-memory[lancedb,pgvector] @ git+https://github.com/TheophilusChinomona/athena-memory@main"
 ```
 
-Pin to a tag with `@v2.0.0` instead of `@main`.
+Pin to a tag with `@v3.0.0` instead of `@main`.
+
+Old `import hermes_memory_lancedb` continues to work via a deprecation shim — the package has the same module surface. New code should use `import athena_memory`.
 
 Base requirements: Python ≥ 3.10, `openai`, `pyarrow`, `httpx`, `click`, `portalocker`. Backend extras add `lancedb`+`tantivy` or `psycopg[binary,pool]`.
 

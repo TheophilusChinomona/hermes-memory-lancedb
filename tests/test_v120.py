@@ -11,7 +11,7 @@ import unittest
 from typing import List
 from unittest.mock import MagicMock, patch
 
-from hermes_memory_lancedb import (
+from athena_memory import (
     _apply_length_normalization,
     _apply_mmr_diversity,
     _clamp01,
