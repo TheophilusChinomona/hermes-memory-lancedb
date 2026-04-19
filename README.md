@@ -482,14 +482,22 @@ Tests that touch LanceDB's native runtime are gated behind a real `import lanced
 
 ## Compatibility
 
-The repo and package were renamed in v3.0.0:
+The repo and package were renamed in v3.0.0 and moved hosting:
 
-- GitHub: `TheophilusChinomona/hermes-memory-lancedb` → `TheophilusChinomona/athena-memory` (GitHub auto-redirects the old URL)
+- **Primary:** `gitlab.com/chinomonatinotenda19/athena-memory` (canonical, accepts contributions)
+- **Mirror:** `github.com/TheophilusChinomona/athena-memory` (read-only)
+- Original location was `github.com/TheophilusChinomona/hermes-memory-lancedb`; GitHub auto-redirects the old URL
 - Distribution: `hermes-memory-lancedb` → `athena-memory`
 - Python module: `hermes_memory_lancedb` → `athena_memory`
 - Console script: `hermes-memory-lancedb` → `athena-memory` (legacy name retained as an alias)
 
 Old code that does `import hermes_memory_lancedb` keeps working through a thin shim that re-exports the entire `athena_memory` surface and aliases all submodules in `sys.modules`. The shim emits a `DeprecationWarning` pointing at the new name and will be removed in a future major version.
+
+For SSH-based installs (committers with deploy keys):
+
+```bash
+pip install "athena-memory[pgvector] @ git+ssh://git@gitlab.com/chinomonatinotenda19/athena-memory.git@main"
+```
 
 ---
 
