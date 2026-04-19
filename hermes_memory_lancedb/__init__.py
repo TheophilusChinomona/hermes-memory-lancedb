@@ -1,6 +1,19 @@
-"""hermes-memory-lancedb v1.2.0 — LanceDB vector memory plugin for Hermes agents.
+"""hermes-memory-lancedb v1.5.0 — LanceDB vector memory plugin for Hermes agents.
 
 Hybrid BM25 + vector recall, Weibull decay, OpenAI text-embedding-3-small.
+
+v1.5.0 additions (P3 of memory-lancedb-pro port — reflection subsystem):
+  - Reflection subpackage (hermes_memory_lancedb.reflection) — 8 modules:
+    store, event_store, item_store, metadata, mapped_metadata, ranking,
+    retry, slices.
+  - Dedicated `reflections` LanceDB table with its own FTS index +
+    optional vector column.
+  - Recency-weighted, importance-boosted ranking (logistic decay).
+  - Lazy init via `LANCEDB_REFLECTION_ENABLED=1` (off by default for
+    backwards compat).
+  - on_session_end now captures a reflection extract in addition to memories.
+  - _hybrid_search optionally pulls top-K reflections (env-tunable).
+  - New tools: lancedb_reflect (explicit write), lancedb_reflections (search).
 
 v1.2.0 additions (P0 of memory-lancedb-pro port — retrieval quality):
   - Cross-encoder reranking via Jina (fallback: cosine of query vs doc vectors)
@@ -38,6 +51,16 @@ import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+from . import reflection as _reflection
+from .reflection import (
+    BuildReflectionStorePayloadsParams,
+    ReflectionErrorSignalLike,
+    ReflectionEventStore,
+    ReflectionItemStore,
+    ReflectionRanker,
+    ReflectionStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +282,56 @@ def _build_session_extraction_prompt(messages: List[Dict]) -> str:
                 lines.append(f"{role}: {content.strip()[:800]}")
     combined = "\n".join(lines)
     return f"Extract durable memories from this full session:\n\n{combined[:8000]}"
+
+
+# ---------------------------------------------------------------------------
+# Reflection prompt (P3)
+# ---------------------------------------------------------------------------
+
+_REFLECTION_SYSTEM = """You are a reflection writer for an AI agent. Read the session and produce a structured markdown reflection in EXACTLY this format:
+
+## Invariants
+- <stable rule that should hold across all future sessions>
+
+## Derived
+- <session-specific change or delta to apply next run>
+
+## User model deltas (about the human)
+- <preference change>
+
+## Agent model deltas (about the assistant/system)
+- <new self-knowledge>
+
+## Lessons & pitfalls (symptom / cause / fix / prevention)
+- <bullet>
+
+## Decisions (durable)
+- <decision>
+
+## Open loops / next actions
+- <follow-up>
+
+Rules:
+- Each section is optional — omit a section entirely if you have nothing useful for it.
+- Bullets must start with "- ".
+- Keep each bullet to one short sentence.
+- Do NOT include reasoning, preamble, or explanations.
+- If the session is too short or contains nothing reflection-worthy, return an empty string."""
+
+
+def _build_reflection_prompt(messages: List[Dict]) -> str:
+    lines = []
+    for m in messages:
+        role = m.get("role", "")
+        if role not in ("user", "assistant"):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+        if content.strip():
+            lines.append(f"{role.capitalize()}: {content.strip()[:800]}")
+    combined = "\n".join(lines)
+    return f"Write a reflection for this session:\n\n{combined[:10000]}"
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +758,13 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         self._extract_lock = threading.Lock()
         self._extract_thread: Optional[threading.Thread] = None
 
+        # Reflection subsystem (P3) — disabled by default for backwards compat.
+        # Enable with LANCEDB_REFLECTION_ENABLED=1.
+        self._reflection_store: Optional[ReflectionStore] = None
+        self._reflection_event_store: ReflectionEventStore = ReflectionEventStore()
+        self._reflection_item_store: ReflectionItemStore = ReflectionItemStore()
+        self._reflection_ranker: ReflectionRanker = ReflectionRanker()
+
     @property
     def name(self) -> str:
         return "lancedb"
@@ -760,13 +840,131 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             self._embedder = _EmbedClient(api_key)
             self._llm = _LLMClient(api_key, model=self._extraction_model)
             self._ready = True
-            logger.info("LanceDB memory v1.1.0 initialized at %s", self._storage_path)
+            logger.info("LanceDB memory v1.5.0 initialized at %s", self._storage_path)
+
+            # P3: lazy-init the reflection store. Default off — set
+            # LANCEDB_REFLECTION_ENABLED=1 to opt in. Embedder is optional;
+            # if absent, the reflection store falls back to FTS-only.
+            if os.environ.get("LANCEDB_REFLECTION_ENABLED") == "1":
+                self._init_reflection_store()
 
             self.queue_prefetch("current targets prospects contacts plans tasks decisions")
 
         except Exception as e:
             logger.warning("LanceDB memory init failed: %s", e, exc_info=True)
             self._ready = False
+
+    # --- Reflection subsystem (P3) ---------------------------------------
+
+    def _init_reflection_store(self) -> None:
+        """Create and initialize the dedicated reflection store.
+
+        Embedder is optional — if missing, the reflection store falls back to
+        BM25/FTS only. Failures are logged but never block the main provider.
+        """
+        try:
+            embed_fn = self._embedder.embed if self._embedder is not None else None
+            self._reflection_store = ReflectionStore(
+                storage_path=self._storage_path,
+                embedder=embed_fn,
+            )
+            ok = self._reflection_store.initialize()
+            if ok:
+                logger.info("LanceDB reflection store initialized at %s", self._storage_path)
+            else:
+                logger.warning("LanceDB reflection store init returned False; reflections disabled.")
+                self._reflection_store = None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Reflection store init failed: %s", e, exc_info=True)
+            self._reflection_store = None
+
+    def _capture_reflection_at_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Build a reflection-shaped markdown summary from session messages
+        and persist it via the reflection store.
+
+        Mirrors the P3 contract: an LLM call extracts lessons-learned in the
+        reflection markdown schema (Invariants / Derived / Lessons / etc.)
+        and the resulting payloads are written to the dedicated table.
+        """
+        if (
+            self._reflection_store is None
+            or not self._reflection_store.is_ready
+            or self._llm is None
+        ):
+            return
+
+        try:
+            prompt = _build_reflection_prompt(messages)
+            reflection_md = self._llm.chat(_REFLECTION_SYSTEM, prompt, max_tokens=1500)
+            if not reflection_md or not reflection_md.strip():
+                return
+            params = BuildReflectionStorePayloadsParams(
+                reflection_text=reflection_md,
+                session_key=os.environ.get("LANCEDB_REFLECTION_SESSION_KEY", self._session_id or "session"),
+                session_id=self._session_id or "session",
+                agent_id=self._user_id,
+                command=os.environ.get("LANCEDB_REFLECTION_COMMAND", "session_end"),
+                scope=os.environ.get("LANCEDB_REFLECTION_SCOPE", "global"),
+                tool_error_signals=[],
+                run_at=time.time() * 1000.0,
+                used_fallback=False,
+                write_legacy_combined=True,
+            )
+            result = self._reflection_store.write_reflection(params)
+            # Mirror to in-memory event/item stores for downstream lookups.
+            try:
+                from .reflection import build_reflection_event_payload as _build_event
+                ev = _build_event(
+                    scope=params.scope,
+                    session_key=params.session_key,
+                    session_id=params.session_id,
+                    agent_id=params.agent_id,
+                    command=params.command,
+                    tool_error_signals=[],
+                    run_at=params.run_at,
+                    used_fallback=False,
+                    event_id=result.get("event_id"),
+                )
+                self._reflection_event_store.append(ev)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Reflection capture failed: %s", e)
+
+    def _search_reflections(self, query: str, *, top_k: int = 3) -> List[Dict]:
+        """Return top-K reflections for ``query`` as result-shaped dicts.
+
+        Each hit is annotated with ``source: "reflection"`` so callers can
+        distinguish reflection-merged results from regular memory results.
+        """
+        store = self._reflection_store
+        if store is None or not store.is_ready or not query:
+            return []
+        try:
+            hits = store.search(query, top_k=top_k)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Reflection search failed: %s", e)
+            return []
+        out: List[Dict] = []
+        for h in hits:
+            out.append({
+                "id": h.id,
+                "content": h.text,
+                "abstract": h.text[:80],
+                "timestamp": h.timestamp,
+                "decay_weight": 1.0,
+                "source": "reflection",
+                "tier": "reflection",
+                "category": "reflection",
+                "access_count": 0,
+                "importance": h.importance,
+                "vector": None,
+                "score": h.score,
+                "kind": h.kind,
+                "scope": h.scope,
+                "event_id": h.event_id,
+            })
+        return out
 
     def _migrate_schema_if_needed(self) -> None:
         if self._table is None:
@@ -934,6 +1132,22 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
 
             # Stage 8: MMR diversity — defer near-duplicates to the tail.
             merged = _apply_mmr_diversity(merged)
+
+            # Stage 9 (P3): Optionally pull top-K reflections via the
+            # reflection store and merge them in. Reflections carry
+            # source="reflection" so consumers can highlight them.
+            if self._reflection_store is not None and self._reflection_store.is_ready:
+                try:
+                    refl_top_k = max(1, int(os.environ.get("LANCEDB_REFLECTION_TOP_K", "3")))
+                except (TypeError, ValueError):
+                    refl_top_k = 3
+                refl_hits = self._search_reflections(query, top_k=refl_top_k)
+                if refl_hits:
+                    # Reflections aren't on the same RRF score scale; preserve
+                    # them by interleaving at the tail of the kept window.
+                    seen_ids = {h.get("id") for h in merged}
+                    refl_hits = [h for h in refl_hits if h.get("id") not in seen_ids]
+                    merged = merged + refl_hits
 
             # Final: take top_k.
             merged = merged[:top_k]
@@ -1142,6 +1356,12 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             except Exception as e:
                 logger.debug("Session-end extraction failed: %s", e)
 
+            # P3: capture a reflection alongside the regular extraction.
+            try:
+                self._capture_reflection_at_session_end(messages)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Reflection capture (session-end) failed: %s", e)
+
         threading.Thread(target=_run, daemon=True, name="lancedb-session-end").start()
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
@@ -1225,6 +1445,48 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
                 "name": "lancedb_stats",
                 "description": "Show memory statistics: total count, tier breakdown, category breakdown.",
                 "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "lancedb_reflect",
+                "description": (
+                    "Explicitly write a reflection (markdown with ## Invariants / ## Derived / "
+                    "## Lessons sections) to the dedicated reflection store. Use when you have "
+                    "a session-summary insight worth persisting separately from regular memory."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reflection_text": {
+                            "type": "string",
+                            "description": "Markdown reflection in the canonical format.",
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Scope tag (default 'global').",
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "Command/event name (default 'manual').",
+                        },
+                    },
+                    "required": ["reflection_text"],
+                },
+            },
+            {
+                "name": "lancedb_reflections",
+                "description": (
+                    "Search ONLY the reflection store (separate from regular memories). "
+                    "Returns invariants, derived deltas, lessons, and decisions tagged with the "
+                    "originating session/event."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "What to search for."},
+                        "top_k": {"type": "integer", "description": "Max results (default 6, max 20)."},
+                    },
+                    "required": ["query"],
+                },
             },
         ]
 
@@ -1317,6 +1579,71 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
             except Exception as e:
                 return json.dumps({"error": str(e)})
 
+        if tool_name == "lancedb_reflect":
+            text = (args.get("reflection_text") or "").strip()
+            if not text:
+                return json.dumps({"error": "reflection_text is required"})
+            if self._reflection_store is None or not self._reflection_store.is_ready:
+                return json.dumps({
+                    "error": "reflection store not enabled",
+                    "hint": "set LANCEDB_REFLECTION_ENABLED=1 and re-initialize",
+                })
+            params = BuildReflectionStorePayloadsParams(
+                reflection_text=text,
+                session_key=self._session_id or "session",
+                session_id=self._session_id or "session",
+                agent_id=self._user_id,
+                command=args.get("command", "manual"),
+                scope=args.get("scope", "global"),
+                tool_error_signals=[],
+                run_at=time.time() * 1000.0,
+                used_fallback=False,
+            )
+            try:
+                result = self._reflection_store.write_reflection(params)
+                return json.dumps({
+                    "stored": result.get("stored", False),
+                    "event_id": result.get("event_id", ""),
+                    "stored_kinds": result.get("stored_kinds", []),
+                    "ids": result.get("ids", []),
+                })
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+
+        if tool_name == "lancedb_reflections":
+            if self._reflection_store is None or not self._reflection_store.is_ready:
+                return json.dumps({
+                    "error": "reflection store not enabled",
+                    "hint": "set LANCEDB_REFLECTION_ENABLED=1 and re-initialize",
+                })
+            query = (args.get("query") or "").strip()
+            if not query:
+                return json.dumps({"error": "query is required"})
+            try:
+                top_k = min(int(args.get("top_k", 6)), 20)
+            except (TypeError, ValueError):
+                top_k = 6
+            try:
+                hits = self._reflection_store.search(query, top_k=top_k)
+            except Exception as e:
+                return json.dumps({"error": str(e)})
+            return json.dumps({
+                "results": [
+                    {
+                        "id": h.id,
+                        "text": h.text[:500],
+                        "kind": h.kind,
+                        "scope": h.scope,
+                        "score": round(float(h.score), 4),
+                        "importance": round(float(h.importance), 2),
+                        "event_id": h.event_id,
+                        "session_id": h.session_id,
+                        "age_days": round(_age_days(h.timestamp / 1000.0 if h.timestamp > 1e10 else h.timestamp), 1),
+                    }
+                    for h in hits
+                ],
+            })
+
         return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
     def shutdown(self) -> None:
@@ -1326,4 +1653,14 @@ class LanceDBMemoryProvider(_MemoryProviderBase):
         logger.info("LanceDB memory shut down.")
 
 
-__all__ = ["LanceDBMemoryProvider"]
+__all__ = [
+    "LanceDBMemoryProvider",
+    "MEMORY_CATEGORIES",
+    # Reflection subsystem (P3) — re-exported for convenient top-level access.
+    "ReflectionStore",
+    "ReflectionEventStore",
+    "ReflectionItemStore",
+    "ReflectionRanker",
+    "BuildReflectionStorePayloadsParams",
+    "ReflectionErrorSignalLike",
+]
