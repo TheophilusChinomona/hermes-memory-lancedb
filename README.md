@@ -21,6 +21,13 @@ This is the Python port of [memory-lancedb-pro](https://github.com/TheophilusChi
 - Hard min-score cutoff (default 0.35, env-tunable)
 - MMR diversity (defers near-duplicates with cosine > 0.85 to the tail)
 
+**Write pipeline (v1.4.0 — P2 upgrades)**
+- Long-context chunker: oversized contents split on sentence boundaries with overlap; chunks share a `parent_id`
+- Batch dedup: pairwise cosine within the candidate batch + a single LLM call vs the existing pool (was 1 call per pair)
+- Admission control: rolling acceptance-rate / novelty / recency / type-prior gate, persisted to `admission_stats.json`
+- Smart metadata: per-write LLM extraction of `memory_temporal_type`, `confidence`, `sensitivity`, `modality`, `fact_key`, `tags` — JSON in `metadata` column
+- Noise prototype filter: ~20 bundled multilingual noise prototypes; rejects writes with cosine ≥ 0.92 to any prototype (combined with the regex filter)
+
 **Write pipeline (v1.1.0)**
 - LLM smart extraction: gpt-4o-mini classifies turns into 6 categories (profile, preferences, entities, events, cases, patterns)
 - 3-level structure per entry: `abstract` (≤80 chars) / `overview` (≤800 chars bullets) / `content` (full narrative)
@@ -83,6 +90,8 @@ The bundled plugin shim at `plugins/memory/lancedb/__init__.py` (in `hermes-agen
 | `LANCEDB_RERANK_ENDPOINT` | `https://api.jina.ai/v1/rerank` | Jina-compatible endpoint |
 | `LANCEDB_RERANK_TIMEOUT_S` | `5.0` | Rerank API timeout in seconds |
 | `LANCEDB_HARD_MIN_SCORE` | `0.35` | Final score cutoff after pipeline |
+| `LANCEDB_ADMISSION_ENABLED` | `1` | Set to `0` to disable the P2 admission controller |
+| `LANCEDB_SMART_METADATA` | `1` | Set to `0` to skip per-write smart metadata LLM calls |
 
 Persistent config in `$HERMES_HOME/lancedb.json`:
 
@@ -119,6 +128,8 @@ Single LanceDB table `memories` with FTS index on `content`:
 | `team_id` | string | P1 — composable column filter |
 | `workspace_id` | string | P1 — composable column filter |
 | `scope` | string | P1 — canonical scope id (e.g. `agent:andrew`) |
+| `metadata` | string | P2 — JSON-encoded smart metadata |
+| `parent_id` | string | P2 — set on chunked rows; empty for atomic writes |
 
 ## Tools exposed to the agent
 
@@ -136,7 +147,7 @@ pip install -e ".[dev]"
 pytest tests/
 ```
 
-84 unit tests cover noise filtering, decay, RRF fusion, tier evaluation, LLM extraction, dedup, prompt builders, and the v1.2.0 retrieval helpers (length norm, MMR, rerank, cosine). Tests that touch the LanceDB native runtime are gated behind a real `lancedb` import — skip them on CPUs without AVX support.
+170+ unit tests cover noise filtering, decay, RRF fusion, tier evaluation, LLM extraction, dedup, prompt builders, the v1.2.0 retrieval helpers (length norm, MMR, rerank, cosine), and the v1.4.0 P2 write-pipeline modules (chunker, batch dedup, admission control, smart metadata, noise prototypes). Tests that touch the LanceDB native runtime are gated behind a real `lancedb` import — skip them on CPUs without AVX support.
 
 ## Status
 
@@ -144,7 +155,7 @@ pytest tests/
 | --- | --- |
 | P0 — Cross-encoder rerank, MMR, length norm, hard min-score | Done (v1.2.0) |
 | P1 — Multi-scope (agent/user/project/team/workspace), multi-provider embeddings (Jina/Gemini/Ollama) | Done (v1.3.0) |
-| P2 — Chunker, batch dedup, admission control, smart metadata, noise prototypes | Pending |
+| P2 — Chunker, batch dedup, admission control, smart metadata, noise prototypes | Done (v1.4.0) |
 | P3 — Reflection subsystem (event store, item store, ranking, retry, slices) | Pending |
 | P4 — Session compactor, memory compactor, temporal classifier, auto-capture cleanup, query expansion | Pending |
 | P5 — Management CLI, retrieval observability, markdown import, A/B reembed | Pending |
