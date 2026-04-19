@@ -18,7 +18,7 @@ This is the Python port of [memory-lancedb-pro](https://github.com/TheophilusChi
 - Multi-scope isolation: `agent_id`, `user_id`, `project_id`, `team_id`, `workspace_id` columns compose orthogonally in the search predicate
 - Built-in scope patterns (`agent:*`, `user:*`, `project:*`, `team:*`, `workspace:*`, `custom:*`, `reflection:*`) plus the `global` scope
 - ClawTeam shared scopes via `CLAWTEAM_MEMORY_SCOPE` env var (CSV)
-- Multi-provider embeddings: OpenAI (default), Jina, Gemini, Ollama, plus any OpenAI-compatible endpoint via `LANCEDB_EMBED_BASE_URL`. Vector dimension is provider-driven and persisted in the schema.
+- Multi-provider embeddings: OpenAI (default), OpenRouter (`openai/`, `cohere/`, `voyage/`, `jina/` model ids), Jina, Gemini, Ollama, plus any OpenAI-compatible endpoint via `LANCEDB_EMBED_BASE_URL`. Vector dimension is provider-driven and persisted in the schema.
 - Backward compatible: legacy tables without scope columns automatically migrate; reads still scope to `user_id` until migration completes.
 
 **Lifecycle & ops (v1.6.0 — P4)**
@@ -91,13 +91,14 @@ The bundled plugin shim at `plugins/memory/lancedb/__init__.py` (in `hermes-agen
 | --- | --- | --- |
 | `OPENAI_API_KEY` | required for default provider | OpenAI embeddings + LLM extraction (`gpt-4o-mini`) |
 | `LANCEDB_PATH` | `$HERMES_HOME/lancedb` | Storage directory |
-| `LANCEDB_EMBED_PROVIDER` | `openai` | One of `openai` / `jina` / `gemini` / `ollama` / `openai-compatible` |
+| `LANCEDB_EMBED_PROVIDER` | `openai` | One of `openai` / `openrouter` / `jina` / `gemini` / `ollama` / `openai-compatible` |
 | `LANCEDB_EMBED_MODEL` | provider default | Override embedding model id |
 | `LANCEDB_EMBED_DIM` | from model id | Explicit embedding dimension override |
 | `LANCEDB_EMBED_BASE_URL` | unset | Custom base URL (required for `openai-compatible`) |
 | `LANCEDB_EMBED_API_KEY` | unset | Generic key override (otherwise reads provider-specific keys) |
 | `JINA_API_KEY` | unset | Required for Jina embeddings |
 | `GEMINI_API_KEY` | unset | Required for Gemini embeddings |
+| `OPENROUTER_API_KEY` | unset | Required for OpenRouter embeddings (default model `openai/text-embedding-3-small`) |
 | `OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Ollama server base URL |
 | `LANCEDB_AGENT_ID` / `LANCEDB_PROJECT_ID` / `LANCEDB_TEAM_ID` / `LANCEDB_WORKSPACE_ID` | unset | Scope identifiers (compose orthogonally) |
 | `CLAWTEAM_MEMORY_SCOPE` | unset | CSV of extra scopes granted to every agent |

@@ -352,6 +352,76 @@ class TestEmbedderFactory(unittest.TestCase):
             with self.assertRaises(EmbeddingError):
                 make_embedder()
 
+    def test_openrouter_provider_selection(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LANCEDB_EMBED")}
+        env["LANCEDB_EMBED_PROVIDER"] = "openrouter"
+        env["OPENROUTER_API_KEY"] = "or-test"
+        env.pop("OPENAI_API_KEY", None)
+        with patch.dict(os.environ, env, clear=True):
+            emb = make_embedder()
+        self.assertIsInstance(emb, OpenAIEmbedder)
+        self.assertEqual(emb.model, "openai/text-embedding-3-small")
+        # Prefix-stripped lookup → 1536 (text-embedding-3-small).
+        self.assertEqual(emb.dimensions, 1536)
+
+    def test_openrouter_uses_openrouter_base_by_default(self):
+        env = {"LANCEDB_EMBED_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "or-key"}
+        with patch.dict(os.environ, env, clear=False):
+            emb = make_embedder()
+        self.assertEqual(emb._base_url, "https://openrouter.ai/api/v1")
+
+    def test_openrouter_custom_base_url_override(self):
+        env = {
+            "LANCEDB_EMBED_PROVIDER": "openrouter",
+            "OPENROUTER_API_KEY": "or-key",
+            "LANCEDB_EMBED_BASE_URL": "https://my-proxy.example.com/v1",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            emb = make_embedder()
+        self.assertEqual(emb._base_url, "https://my-proxy.example.com/v1")
+
+    def test_openrouter_custom_model_dim_resolution(self):
+        # cohere/embed-english-v3.0 isn't in EMBEDDING_DIMENSIONS — falls back
+        # to provider default (1536).
+        env = {
+            "LANCEDB_EMBED_PROVIDER": "openrouter",
+            "OPENROUTER_API_KEY": "or-key",
+            "LANCEDB_EMBED_MODEL": "cohere/embed-english-v3.0",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            emb = make_embedder()
+        self.assertEqual(emb.model, "cohere/embed-english-v3.0")
+        self.assertEqual(emb.dimensions, 1536)  # openrouter fallback
+
+    def test_openrouter_voyage_model_dim_via_prefix_strip(self):
+        # voyage-3 IS in EMBEDDING_DIMENSIONS (1024) — prefix strip should hit.
+        env = {
+            "LANCEDB_EMBED_PROVIDER": "openrouter",
+            "OPENROUTER_API_KEY": "or-key",
+            "LANCEDB_EMBED_MODEL": "voyage/voyage-3",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            emb = make_embedder()
+        self.assertEqual(emb.dimensions, 1024)
+
+    def test_openrouter_sends_dimensions_for_v3_family(self):
+        from hermes_memory_lancedb.embedders import _is_openai_v3_family
+        # Both prefixed and bare model ids should be recognised.
+        self.assertTrue(_is_openai_v3_family("text-embedding-3-small"))
+        self.assertTrue(_is_openai_v3_family("openai/text-embedding-3-large"))
+        self.assertFalse(_is_openai_v3_family("text-embedding-ada-002"))
+        self.assertFalse(_is_openai_v3_family("openai/text-embedding-ada-002"))
+        self.assertFalse(_is_openai_v3_family("voyage/voyage-3"))
+
+    def test_openrouter_is_provider_available(self):
+        from hermes_memory_lancedb.embedders import is_provider_available
+        env = {k: v for k, v in os.environ.items() if "API_KEY" not in k}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertFalse(is_provider_available("openrouter"))
+        env["OPENROUTER_API_KEY"] = "or"
+        with patch.dict(os.environ, env, clear=True):
+            self.assertTrue(is_provider_available("openrouter"))
+
     def test_dim_override_via_env(self):
         env = {
             "LANCEDB_EMBED_PROVIDER": "openai",
@@ -741,10 +811,13 @@ class TestEmbeddingDimensions(unittest.TestCase):
         self.assertEqual(EMBEDDING_DIMENSIONS["text-embedding-004"], 768)
 
     def test_provider_default_models_have_known_dims(self):
+        # OpenRouter defaults use provider-prefixed model ids (e.g.
+        # "openai/text-embedding-3-small"); allow lookup via prefix-strip.
+        from hermes_memory_lancedb.embedders import _strip_provider_prefix
         for provider, model in PROVIDER_DEFAULT_MODEL.items():
-            # All defaults should be in the dim table
-            self.assertIn(
-                model, EMBEDDING_DIMENSIONS,
+            stripped = _strip_provider_prefix(model)
+            self.assertTrue(
+                model in EMBEDDING_DIMENSIONS or stripped in EMBEDDING_DIMENSIONS,
                 f"Provider {provider} default model {model} missing from EMBEDDING_DIMENSIONS",
             )
 
